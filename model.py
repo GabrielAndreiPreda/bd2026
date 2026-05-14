@@ -20,13 +20,16 @@ from sklearn.metrics import (
 
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.layers import Input, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
+print("GPUs available:", tf.config.list_physical_devices("GPU"))
+
 from xgboost import XGBClassifier
+from sklearn.model_selection import GridSearchCV
 
 # %%
-df = pd.read_csv("/kaggle/input/<your-dataset-slug>/credit_card_dataset.csv")
+df = pd.read_csv("/kaggle/input/datasets/gabrielpredaz/creditcarddata/credit_card_data.csv")
 
 print(df.shape)
 print(df.head())
@@ -55,6 +58,7 @@ X_test_scaled = scaler.transform(X_test)
 
 # %%
 # Autoencoder architecture: 34 -> 24 -> 16 -> 10 -> 16 -> 24 -> 34
+# Dropout added to encoder layers to force more robust latent representations
 input_dim = X_train_scaled.shape[1]
 encoding_dim = 10
 
@@ -62,7 +66,9 @@ inputs = Input(shape=(input_dim,))
 
 # Encoder
 x = Dense(24, activation="relu")(inputs)
+x = Dropout(0.2)(x)
 x = Dense(16, activation="relu")(x)
+x = Dropout(0.2)(x)
 encoded = Dense(encoding_dim, activation="relu")(x)
 
 # Decoder
@@ -111,23 +117,48 @@ X_test_encoded = encoder.predict(X_test_scaled)
 print("Encoded train shape:", X_train_encoded.shape)
 print("Encoded test shape:", X_test_encoded.shape)
 
+# Move to GPU so XGBoost doesn't have to copy on every call
+import cupy as cp
+X_train_encoded = cp.array(X_train_encoded)
+X_test_encoded = cp.array(X_test_encoded)
+
 # %%
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 print(f"scale_pos_weight: {scale_pos_weight:.2f}")
 
-xgb_model = XGBClassifier(
-    n_estimators=200,
-    max_depth=5,
-    learning_rate=0.1,
-    subsample=0.8,
-    colsample_bytree=0.8,
+param_grid = {
+    "n_estimators":     [200, 400],
+    "max_depth":        [4, 6],
+    "learning_rate":    [0.05, 0.1],
+    "subsample":        [0.8, 0.9],
+    "colsample_bytree": [0.8, 1.0],
+    "min_child_weight": [1, 3],
+    "gamma":            [0, 0.1],
+}
+
+base_xgb = XGBClassifier(
     scale_pos_weight=scale_pos_weight,
     random_state=42,
     eval_metric="logloss",
-    use_label_encoder=False
+    device="cuda",      # GPU acceleration
+    tree_method="hist"  # required for GPU in XGBoost >= 2.0
 )
 
-xgb_model.fit(X_train_encoded, y_train)
+grid_search = GridSearchCV(
+    estimator=base_xgb,
+    param_grid=param_grid,
+    scoring="roc_auc",
+    cv=5,
+    n_jobs=1,     # must be 1 when XGBoost uses GPU — parallelism happens inside XGBoost
+    verbose=2
+)
+
+grid_search.fit(X_train_encoded, y_train)
+
+print("Best params:", grid_search.best_params_)
+print("Best CV AUC-ROC:", grid_search.best_score_.round(4))
+
+xgb_model = grid_search.best_estimator_
 
 # %%
 y_pred = xgb_model.predict(X_test_encoded)
@@ -177,3 +208,51 @@ plt.title("XGBoost Feature Importance (Encoded Dimensions)")
 plt.xlabel("Importance Score")
 plt.tight_layout()
 plt.show()
+
+# %%
+# Mean absolute Jacobian: how much each raw input feature drives each bottleneck neuron
+# Computed on a subset of training data for efficiency
+feature_names = X.columns.tolist()
+
+n_samples = min(3000, len(X_train_scaled))
+X_jac = X_train_scaled[:n_samples]
+
+all_jac = []
+jac_batch = 256
+
+for i in range(0, n_samples, jac_batch):
+    x_batch = tf.constant(X_jac[i:i+jac_batch], dtype=tf.float32)
+    with tf.GradientTape() as tape:
+        tape.watch(x_batch)
+        enc_out = encoder(x_batch, training=False)
+    jac = tape.jacobian(enc_out, x_batch).numpy()  # (n, 10, n, 34)
+    n = jac.shape[0]
+    # Extract per-sample diagonal: jac[i, :, i, :] -> (n, 10, 34)
+    jac = jac[np.arange(n), :, np.arange(n), :]
+    all_jac.append(np.abs(jac))
+
+mean_jac = np.mean(np.concatenate(all_jac, axis=0), axis=0)  # (10, 34)
+
+plt.figure(figsize=(18, 6))
+sns.heatmap(
+    mean_jac,
+    xticklabels=feature_names,
+    yticklabels=[f"Latent Dim {i}" for i in range(encoding_dim)],
+    cmap="YlOrRd",
+    annot=False,
+    linewidths=0.3
+)
+plt.title("Mean Absolute Jacobian: Raw Feature → Bottleneck Neuron")
+plt.xlabel("Input Feature")
+plt.ylabel("Bottleneck Neuron")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.show()
+
+# %%
+# Top 5 contributing features per bottleneck neuron
+print("Top 5 input features per bottleneck neuron:\n")
+for dim in range(encoding_dim):
+    top_idx = np.argsort(mean_jac[dim])[::-1][:5]
+    top = [(feature_names[j], round(float(mean_jac[dim][j]), 4)) for j in top_idx]
+    print(f"  Latent Dim {dim}: {top}")
