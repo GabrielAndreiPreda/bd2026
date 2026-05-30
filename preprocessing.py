@@ -1,5 +1,5 @@
 # %%
-!pip install pandas numpy matplotlib seaborn scikit-learn
+# !pip install pandas numpy matplotlib seaborn scikit-learn
 
 # %%
 import pandas as pd
@@ -20,9 +20,9 @@ from sklearn.metrics import (
 )
 
 # %%
-from google.colab import files
+# from google.colab import files
 
-uploaded = files.upload()
+# uploaded = files.upload()
 
 # %%
 df = pd.read_csv("UCI_Credit_Card.csv")
@@ -118,9 +118,11 @@ print(df.columns)
 
 # %%
 df["EDUCATION"] = df["EDUCATION"].replace([0, 5, 6], 4)
+df["MARRIAGE"] = df["MARRIAGE"].replace(0, 3)
 
 # %%
 df.drop("ID", axis=1, inplace=True)
+df = df.drop_duplicates().reset_index(drop=True)
 
 # %%
 pays = ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
