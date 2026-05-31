@@ -102,33 +102,18 @@ def set_global_seed(seed):
 
 
 # ---------------------------------------------------------------------------
-# Data + feature engineering (mirrors model.py L42–L78)
+# Data loading — CSV is fully preprocessed by preprocessing.py
 # ---------------------------------------------------------------------------
 
-def _signed_log1p(s):
-    return np.sign(s) * np.log1p(np.abs(s))
+def load_data(csv_path):
+    """Load the ML-ready CSV produced by preprocessing.py.
 
-
-def load_and_engineer(csv_path):
+    Drops the three interpretability-only columns that are retained in the
+    CSV but not used for training.
+    """
     df = pd.read_csv(csv_path)
-
-    bill_cols = ["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6"]
-    df["n_months_over_limit"] = df[bill_cols].gt(df["LIMIT_BAL"], axis=0).sum(axis=1).astype(np.int8)
-
-    cols_to_drop = [
-        "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
-        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
-        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
-        "Pays_amts_total", "Utilization_1", "Risk_score",
-    ]
-    df = df.drop(columns=cols_to_drop)
-
-    log_cols = ["LIMIT_BAL", "Bill_mean", "Bill_std", "Bill_max", "Pays_amts_mean", "Utilization_mean"]
-    df[log_cols] = df[log_cols].apply(_signed_log1p)
-
-    df = pd.get_dummies(df, columns=["SEX", "EDUCATION", "MARRIAGE"], drop_first=True, dtype=np.float32)
-
-    X = df.drop("default_payment", axis=1)
+    drop_cols = ["Pays_amts_total", "Utilization_1", "Risk_score"]
+    X = df.drop(columns=["default_payment"] + drop_cols)
     y = df["default_payment"]
     return X, y
 
@@ -447,8 +432,8 @@ def main():
     print(f"Seeds: {SEEDS}")
     print(f"Conditions: {[c['id'] for c in CONDITIONS]}")
 
-    print("\nLoading and engineering features...")
-    X, y = load_and_engineer(CSV_PATH)
+    print("\nLoading features...")
+    X, y = load_data(CSV_PATH)
     print(f"Shape: {X.shape}, positive rate: {y.mean():.3f}")
 
     records = []

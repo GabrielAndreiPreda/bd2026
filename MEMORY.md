@@ -20,15 +20,20 @@ into XGBoost (GridSearchCV-tuned). All fixes go into preprocessing or feature
 representation, never into a different model family.
 
 Files in the repo:
-- `credit_card_data.csv` — 30,000 × 35, output of `preprocessing.py` with all
-  engineered features already computed. This is what `model.py` reads on
-  Kaggle.
-- `preprocessing.py` — runs on the original UCI CSV; recodes unknown
-  categoricals, engineers payment/billing summary features, writes the CSV
-  above.
-- `model.py` — loads `credit_card_data.csv`, drops raw temporal columns, log/
-  one-hot transforms, trains the AE, encodes into latents, trains XGBoost,
-  calibrates, tunes a decision threshold, evaluates.
+- `credit_card_data.csv` — ML-ready CSV output of `preprocessing.py`. Contains
+  engineered features, log-transformed monetary columns, and one-hot dummies.
+  Downstream scripts load this and go straight to split/scale/train.
+- `preprocessing.py` — single source of truth for all feature work: runs on
+  `UCI_Credit_Card.csv`, applies hygiene, engineers summaries, drops raw
+  temporal cols, applies signed-log, one-hots SEX/EDUCATION/MARRIAGE, writes
+  `credit_card_data.csv`. Re-run if you change any feature logic.
+- `eda.py` — read-only EDA companion; reads `credit_card_data.csv` and
+  produces distribution plots, correlation heatmaps, and group summaries.
+  Writes `correlation_results.csv` and `default_summary.csv`.
+- `model.py` — loads `credit_card_data.csv`, drops three interpretability-only
+  cols, trains the AE, encodes into latents, trains XGBoost, calibrates, tunes
+  threshold, evaluates with full diagnostics (plots, Jacobian heatmap).
+- `benchmark.py` — A/B harness; same load + drop, then 7 conditions × 3 seeds.
 - `README.md` — original dataset documentation.
 
 ---
@@ -36,35 +41,48 @@ Files in the repo:
 ## Pipeline at a glance (current state)
 
 ```
-credit_card_data.csv (30,000 × 35, engineered)
+UCI_Credit_Card.csv (30,000 rows, raw)
   │
   ▼
-model.py
+preprocessing.py
   │
-  ├─ Compute n_months_over_limit (0–6) from raw BILL_AMTs
-  ├─ Drop raw temporal cols + redundant engineered cols
+  ├─ Recode EDUCATION {0,5,6}→4, MARRIAGE 0→3
+  ├─ Drop ID; drop 35 duplicate rows (~29,965 rows remain)
+  ├─ Engineer Pay_delay_*, Bill_*, Pays_amts_*, Utilization_*, Risk_score,
+  │   n_months_over_limit (from raw BILL_AMTs before they are dropped)
+  ├─ Drop raw temporal cols: PAY_2–6, BILL_AMT1–6, PAY_AMT1–6 (keep PAY_0)
   ├─ Signed-log heavy-tailed monetary cols
   ├─ One-hot SEX / EDUCATION / MARRIAGE (drop_first)
+  └─ Write credit_card_data.csv
   │
-  ├─ Stratified split: train 80% / test 20%
-  ├─ Carve 10% calibration slice from train (stratified)
-  │   → train ≈ 21,569 rows, cal ≈ 2,397, test ≈ 6,000
+  ▼
+credit_card_data.csv (~29,965 rows, ML-ready)
   │
-  ├─ StandardScaler (fit on train only) → train/cal/test scaled
+  ├── eda.py (optional, read-only — distributions, heatmaps, group analyses)
   │
-  ├─ Autoencoder 18 → 24 → 16 → 10 → 16 → 24 → 18, MSE loss
-  │   with sample_weight upweighting defaulters (~3.52×)
-  │
-  ├─ Encode train/cal/test → 10-dim latents
-  ├─ Concat raw scaled PAY_0 → 11-dim feature matrices
-  │
-  ├─ XGBoost via GridSearchCV (scoring=average_precision, cv=5)
-  │   with scale_pos_weight ≈ 3.52
-  │
-  ├─ CalibratedClassifierCV(isotonic, cv='prefit') fit on X_cal
-  ├─ F1-optimal threshold tuned on calibrated cal-slice predictions
-  │
-  └─ Test eval: PR-AUC, Brier, F1@τ*, accuracy, ROC-AUC
+  └── model.py / benchmark.py
+        │
+        ├─ Drop Pays_amts_total, Utilization_1, Risk_score (kept in CSV for
+        │   interpretability, not used for training)
+        ├─ Stratified split: train 80% / test 20%
+        ├─ Carve 10% calibration slice from train (stratified)
+        │   → train ≈ 21,569 rows, cal ≈ 2,397, test ≈ 6,000
+        │
+        ├─ StandardScaler (fit on train only) → train/cal/test scaled
+        │
+        ├─ Autoencoder 18 → 24 → 16 → 10 → 16 → 24 → 18, MSE loss
+        │   with sample_weight upweighting defaulters (~3.52×)
+        │
+        ├─ Encode train/cal/test → 10-dim latents
+        ├─ Concat raw scaled PAY_0 → 11-dim feature matrices
+        │
+        ├─ XGBoost via GridSearchCV (scoring=average_precision, cv=5)
+        │   with scale_pos_weight ≈ 3.52
+        │
+        ├─ CalibratedClassifierCV(isotonic, cv='prefit') fit on X_cal
+        ├─ F1-optimal threshold tuned on calibrated cal-slice predictions
+        │
+        └─ Test eval: PR-AUC, Brier, F1@τ*, accuracy, ROC-AUC
 ```
 
 ---
@@ -191,8 +209,9 @@ reduced grid. Outputs:
 below this one after the first run.**
 
 `benchmark.py` is the canonical comparator; `model.py` stays as the
-human-readable single-condition reference. If they diverge in feature
-engineering, the benchmark wins.
+human-readable single-condition reference. Both load the same
+`credit_card_data.csv` and apply the same three-column drop — no feature
+engineering duplication.
 
 ## What's NOT been done (the rest of the imbalance menu)
 

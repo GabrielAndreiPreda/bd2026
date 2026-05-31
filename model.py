@@ -40,47 +40,14 @@ print(df.shape)
 print(df.head())
 
 # %%
-bill_cols = ["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6"]
-df["n_months_over_limit"] = df[bill_cols].gt(df["LIMIT_BAL"], axis=0).sum(axis=1).astype(np.int8)
-
-# %%
-# Keep: demographics, PAY_0 (strongest single predictor), engineered summaries
-# Drop: raw temporal months (PAY_2-6, all BILL/PAY_AMTs) + redundant engineered features
-cols_to_drop = [
-    # Raw temporal — replaced by engineered summaries
-    "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
-    "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
-    "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
-    # Redundant engineered: Pays_amts_total = mean×6, Utilization_1 = single month,
-    # Risk_score = linear combo of features already kept
-    "Pays_amts_total", "Utilization_1", "Risk_score",
-]
-df.drop(columns=cols_to_drop, inplace=True)
-print("Shape after column selection:", df.shape)
-
-# %%
-# Signed-log on heavy-tailed monetary features so MSE reconstruction isn't dominated
-# by rare extreme rows (PAY_AMT2 hits z=72.9 under plain StandardScaler).
-def signed_log1p(s):
-    return np.sign(s) * np.log1p(np.abs(s))
-
-log_cols = ["LIMIT_BAL", "Bill_mean", "Bill_std", "Bill_max", "Pays_amts_mean", "Utilization_mean"]
-df[log_cols] = df[log_cols].apply(signed_log1p)
-
-# %%
-# One-hot nominal categoricals — MSE on ordinal-coded SEX/EDUCATION/MARRIAGE
-# treats them as continuous distances, which is meaningless.
-df = pd.get_dummies(
-    df,
-    columns=["SEX", "EDUCATION", "MARRIAGE"],
-    drop_first=True,
-    dtype=np.float32,
-)
-print("Features:", df.drop("default_payment", axis=1).columns.tolist())
-
-# %%
-X = df.drop("default_payment", axis=1)
+# CSV is fully preprocessed by preprocessing.py (log transforms, one-hot, feature
+# engineering). Drop the three interpretability-only columns kept in the CSV but
+# not used for training (Pays_amts_total = mean×6, Utilization_1 = single month,
+# Risk_score = linear combo of features already kept).
+X = df.drop(columns=["default_payment", "Pays_amts_total", "Utilization_1", "Risk_score"])
 y = df["default_payment"]
+
+print("Features:", X.columns.tolist())
 
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
