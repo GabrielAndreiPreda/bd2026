@@ -58,7 +58,7 @@ def _find_csv():
 
 
 CSV_PATH = _find_csv()
-OUT_DIR = Path(__file__).resolve().parent / "bench_out"
+OUT_DIR = Path("/kaggle/working/bench_out") if Path("/kaggle/working").exists() else Path(__file__).resolve().parent / "bench_out"
 SEEDS = [0, 1, 2]
 
 # Reduced grid: 16 cells × 5 folds = 80 fits per condition.
