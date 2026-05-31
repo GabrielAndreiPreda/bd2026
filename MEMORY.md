@@ -163,24 +163,48 @@ iteration.
 
 ---
 
+## Benchmark harness
+
+`/mnt/e/Projects/Master/BD/benchmark.py` runs 7 conditions × 3 seeds with a
+reduced 16-cell XGBoost grid and writes a markdown report + long CSV to
+`bench_out/`. Conditions:
+
+| ID | What it is | What it isolates |
+|---|---|---|
+| C0 | XGB-only, `scale_pos_weight=auto` | XGB-only baseline with imbalance correction |
+| C1 | XGB-only, `scale_pos_weight=1` | XGB-only without imbalance correction |
+| C2 | AE+XGB current (B.4 + C.3) | The instrumented baseline in model.py |
+| C3 | AE+XGB without B.4 (class-blind AE) | Does weighted AE loss contribute? |
+| C4 | AE+XGB without C.3 (latents only) | Does PAY_0 concat contribute? |
+| C5 | AE+XGB + SMOTE on latents | Latent-space oversampling vs `scale_pos_weight` |
+| C6 | AE+XGB + Borderline-SMOTE | Boundary-aware oversampling variant |
+
+Run with `python benchmark.py`. Expected wall clock: ~2–3 hours on GPU with the
+reduced grid. Outputs:
+- `bench_out/results_long.csv` — one row per (condition, seed) with metrics
+- `bench_out/report.md` — mean ± std table + conclusion
+- `bench_out/best_params_<cond>_<seed>.json` — chosen grid cell per run
+- `bench_out/cal_diag_<cond>_<seed>.npz` — probabilities for offline reliability diagrams
+- `bench_out/pr_curves_<cond>_<seed>.npz` — test PR curves
+
+**Results: not yet recorded — append a "Benchmark results (date)" section
+below this one after the first run.**
+
+`benchmark.py` is the canonical comparator; `model.py` stays as the
+human-readable single-condition reference. If they diverge in feature
+engineering, the benchmark wins.
+
 ## What's NOT been done (the rest of the imbalance menu)
 
-These are queued for benchmarking against the current instrumented baseline.
-Each becomes one row in a results table; report PR-AUC mean ± std (5 outer
-seeds), F1@τ\*, Brier, and τ\*.
+A.3 SMOTE and A.5 Borderline-SMOTE on latents are now wired in as benchmark
+conditions C5 and C6. Still queued for future benchmarks:
 
-Order to try (cheap × high-likelihood first):
-
-1. **A.3 — SMOTE on the 10-dim latents inside CV folds** via
-   `imblearn.pipeline.Pipeline`. Set `scale_pos_weight=1` to avoid
-   double-correction.
-2. **A.5 — Borderline-SMOTE** — drop-in replacement.
-3. **C.1 — One-class AE on majority only, reconstruction error as feature.**
+1. **C.1 — One-class AE on majority only, reconstruction error as feature.**
    Bigger architectural rearrangement; the theoretically correct use of an AE
    for imbalanced classification.
-4. **E.1 — BalancedBaggingClassifier wrapping XGBoost** with a reduced grid
+2. **E.1 — BalancedBaggingClassifier wrapping XGBoost** with a reduced grid
    (16–32 cells; the bagging multiplies cost).
-5. **B.3 — Focal loss as custom XGBoost objective.** Last because high effort
+3. **B.3 — Focal loss as custom XGBoost objective.** Last because high effort
    and unlikely to dominate a well-tuned SMOTE baseline.
 
 Do not try:
