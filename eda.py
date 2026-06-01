@@ -5,16 +5,23 @@ Reads the ML-ready credit_card_data.csv produced by preprocessing.py.
 Run any time you want to re-inspect distributions, correlations, and group
 statistics. Does not modify the CSV or any model inputs.
 
-Outputs: correlation_results.csv, default_summary.csv
+Outputs: eda_plots/*.png, correlation_results.csv, default_summary.csv
 """
 
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 
+HERE = Path(__file__).resolve().parent
+OUT  = HERE / "eda_plots"
+OUT.mkdir(exist_ok=True)
 
-df = pd.read_csv("credit_card_data.csv")
+df = pd.read_csv(HERE / "credit_card_data.csv")
 
 engineered_feats = [
     "Pay_delay_mean", "Pay_delay_max",
@@ -31,44 +38,58 @@ print("\nTarget Percentages:\n", target_percent)
 plt.figure(figsize=(6, 4))
 sns.countplot(x="default_payment", data=df)
 plt.title("Default vs Non-Default Distribution")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "target_distribution.png", dpi=150)
+plt.close()
 
 # ── Credit limit distribution (signed-log scale after preprocessing) ──────────
 plt.figure(figsize=(6, 4))
 sns.histplot(df["LIMIT_BAL"], bins=30, kde=True)
 plt.title("Credit Limit Distribution (signed-log scale)")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "credit_limit_distribution.png", dpi=150)
+plt.close()
 
 # ── Age distribution ──────────────────────────────────────────────────────────
 plt.figure(figsize=(6, 4))
 sns.histplot(df["AGE"], bins=30, kde=True)
 plt.title("Age Distribution")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "age_distribution.png", dpi=150)
+plt.close()
 
 # ── Full correlation heatmap ──────────────────────────────────────────────────
 plt.figure(figsize=(18, 12))
 sns.heatmap(df.corr(numeric_only=True), cmap="coolwarm", linewidths=0.2)
 plt.title("Feature Correlation Heatmap")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "correlation_heatmap_full.png", dpi=150)
+plt.close()
 
 # ── PAY_0 distribution ────────────────────────────────────────────────────────
 plt.figure(figsize=(6, 4))
 df["PAY_0"].hist(bins=20)
 plt.title("PAY_0 (September payment status) Distribution")
 plt.xlabel("PAY_0")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "pay0_distribution.png", dpi=150)
+plt.close()
 
 # ── Outlier boxplots ──────────────────────────────────────────────────────────
 for col in ["LIMIT_BAL", "AGE", "Bill_mean", "Pays_amts_mean"]:
     plt.figure(figsize=(6, 4))
     sns.boxplot(x=df[col])
     plt.title(f"Outliers in {col}")
-    plt.show()
+    plt.tight_layout()
+    plt.savefig(OUT / f"boxplot_{col.lower()}.png", dpi=150)
+    plt.close()
 
 # ── Engineered feature distributions ─────────────────────────────────────────
 df[engineered_feats].hist(figsize=(12, 8), bins=20)
 plt.suptitle("Engineered Feature Distributions")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "engineered_features_distributions.png", dpi=150)
+plt.close()
 
 # ── Engineered features correlation with target ───────────────────────────────
 plt.figure(figsize=(12, 10))
@@ -77,7 +98,9 @@ sns.heatmap(
     cmap="coolwarm", annot=True,
 )
 plt.title("Correlation with Engineered Features")
-plt.show()
+plt.tight_layout()
+plt.savefig(OUT / "correlation_heatmap_engineered.png", dpi=150)
+plt.close()
 
 # ── All-feature correlation with target ───────────────────────────────────────
 corr_target = (
@@ -117,6 +140,7 @@ for col in ["LIMIT_BAL", "Bill_mean", "Pays_amts_mean"]:
     print(f"{col}: {n_out} outliers")
 
 # ── Save EDA outputs ──────────────────────────────────────────────────────────
-corr_target.to_csv("correlation_results.csv")
-summary.to_csv("default_summary.csv")
-print("\nSaved correlation_results.csv and default_summary.csv")
+corr_target.to_csv(HERE / "correlation_results.csv")
+summary.to_csv(HERE / "default_summary.csv")
+print(f"\nSaved correlation_results.csv and default_summary.csv")
+print(f"Saved {len(list(OUT.glob('*.png')))} plots to {OUT}/")
