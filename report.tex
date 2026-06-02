@@ -6,6 +6,7 @@
 \usepackage{amssymb}
 \usepackage[hidelinks]{hyperref}
 \usepackage{caption}
+\usepackage{subcaption}
 \usepackage{array}
 \usepackage{microtype}
 \usepackage{parskip}
@@ -14,12 +15,15 @@
 \usepackage{lmodern}
 \usepackage{xcolor}
 \usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{float}
 
 \setstretch{1.15}
+\graphicspath{{./}}
 
 \title{\textbf{Credit Card Default Prediction}\\[0.4em]
-       \large Autoencoder Feature Extraction and XGBoost Classification\\
-       on the UCI Taiwan Dataset}
+       \large A Multi-Model Study: Autoencoder/XGBoost, Logistic Regression/PCA,\\
+       UMAP/KNN, and SVM/LDA on the UCI Taiwan Dataset}
 \author{BigData 2026 Project Team}
 \date{June 2026}
 
@@ -33,359 +37,554 @@
 \section{Introduction}
 %─────────────────────────────────────────────────────────────────────────────
 
-The UCI Taiwan credit card dataset records payment history for 30,000 customers
-from April to September 2005. The prediction target is whether a customer
-defaulted on their October 2005 payment. Of the 30,000 customers, 6,636 (22.1\%)
-defaulted, giving a 78/22 class split that makes the problem a standard
-imbalanced binary classification task.
+Credit card default prediction is a binary classification problem with a
+pronounced class imbalance: most customers do not default. The UCI Taiwan
+dataset records repayment history for 30,000 customers from April to
+September 2005, and the target is whether each customer defaulted on their
+October 2005 payment. Of the 30,000 original records, 6,636 (22.1\%)
+defaulted. This 78/22 split makes accuracy an unreliable primary metric
+and forces evaluation to focus on precision-recall behaviour.
 
-The project constraint fixes the model family: a Keras dense autoencoder
-compresses 18 input features into a low-dimensional latent representation, and
-XGBoost then classifies from those latents. We cannot switch to a different
-classifier family, but we can control the autoencoder's training objective,
-how latents are passed to XGBoost, how class imbalance is handled, and how
-probabilities are post-processed into binary decisions.
+This report documents a team experiment comparing four model families on
+the same dataset, train/test split, and evaluation protocol. The fixed
+pipeline constraint for the main model (Contributor~1) requires a Keras
+dense autoencoder as a feature extractor feeding an XGBoost classifier.
+Three teammates independently implemented alternative pipelines:
+Logistic Regression with and without PCA dimensionality reduction
+(Contributor~2), UMAP nonlinear projection with k-nearest neighbours
+(Contributor~3), and a radial-basis-function SVM with and without
+Linear Discriminant Analysis (Contributor~4).
 
-This report covers every design decision in the pipeline: why each preprocessing
-step exists, what the autoencoder and XGBoost do and why we configured them as
-we did, what the evaluation metrics measure, and what seven ablation conditions
-reveal about which parts of the architecture contribute to predictive quality.
+Each pipeline tests whether the chosen dimensionality reduction technique
+helps or hurts, and what class-imbalance handling strategy performs best.
+Section~\ref{sec:results} consolidates all results under a shared evaluation
+protocol so the models are directly comparable.
 
 %─────────────────────────────────────────────────────────────────────────────
-\section{Dataset and Preprocessing}
+\section{Dataset}
 %─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Raw features and hygiene}
+The raw CSV contains 25 columns. One is a customer identifier (dropped before
+modelling). Three are demographics: AGE, SEX (1 = male, 2 = female), and two
+categoricals with documented codes: EDUCATION (1 = graduate school,
+2 = university, 3 = high school, 4 = others) and MARRIAGE (1 = married,
+2 = single, 3 = others).
 
-The raw CSV contains 25 columns: a customer ID, the credit limit
-(\texttt{LIMIT\_BAL}), three demographic variables (AGE, SEX, EDUCATION,
-MARRIAGE), and 18 temporal columns recording, for each of the six months
-April--September 2005, the repayment status (\texttt{PAY\_0}--\texttt{PAY\_6}),
-the statement balance (\texttt{BILL\_AMT1}--\texttt{BILL\_AMT6}), and the
-amount paid (\texttt{PAY\_AMT1}--\texttt{PAY\_AMT6}).
+The remaining 19 columns record six months of payment history for each
+customer. For each month from April (subscript~6) to September (subscript~1)
+the dataset records: the repayment status (\texttt{PAY\_0}--\texttt{PAY\_6},
+where $-2$ and $-1$ indicate early or on-time payment, 1--8 indicate months
+of delay), the statement balance (\texttt{BILL\_AMT1}--\texttt{BILL\_AMT6},
+in New Taiwan dollars), and the amount paid (\texttt{PAY\_AMT1}--\texttt{PAY\_AMT6},
+in NT\$). Credit limits (\texttt{LIMIT\_BAL}) range from 10,000 to
+1,000,000~NT\$.
 
-Three hygiene operations precede any feature engineering. First, the EDUCATION
-column contains codes 0, 5, and 6 that the dataset README does not define; we
-recode all three to 4, which the README labels ``others.'' Second, the MARRIAGE
-column contains 54 rows with code 0, which is similarly undocumented; these are
-recoded to 3 (``others''). Third, 35 rows are exact duplicates of other rows.
-These are dropped before any train/test split, because leaving them in risks
-placing the same record in both the training and test sets, inflating measured
-performance. After deduplication, 29,965 rows remain.
+The dataset has three known quality issues. The EDUCATION column contains
+codes 0, 5, and 6 that the dataset README does not define; 468 rows carry
+these codes. The MARRIAGE column contains code~0 in 54 rows, also
+undocumented. Both are recoded as described in Section~\ref{sec:preprocessing}.
+Additionally, 35 rows are exact duplicates of other rows, which must be
+removed before splitting to prevent test-set leakage. After removal,
+29,965 rows remain.
 
-\subsection{Feature engineering and column selection}
+%─────────────────────────────────────────────────────────────────────────────
+\section{Preprocessing and Feature Engineering}
+\label{sec:preprocessing}
+%─────────────────────────────────────────────────────────────────────────────
 
-Feeding 18 raw temporal columns directly to an autoencoder has two costs:
-high dimensionality and strong within-group multicollinearity. The six bill
-amounts, for instance, track a single underlying credit exposure and correlate
-with one another above $r = 0.9$. We engineer summary statistics that capture
-the same information with fewer dimensions.
+\subsection{Data hygiene}
 
-From the six payment-status columns we compute \texttt{Pay\_delay\_mean},
-\texttt{Pay\_delay\_max}, and \texttt{Pay\_delay\_std}. From the six bill amounts
-we compute \texttt{Bill\_mean}, \texttt{Bill\_std}, and \texttt{Bill\_max}. From
-the six payment amounts we compute \texttt{Pays\_amts\_total} and
-\texttt{Pays\_amts\_mean}. We also add two utilization features
-(\texttt{Utilization\_1} and \texttt{Utilization\_mean}), a composite risk score,
-and \texttt{n\_months\_over\_limit} (the count of months in which the outstanding
-balance exceeded the credit limit). After engineering, all 18 raw temporal
-columns except \texttt{PAY\_0} are dropped. \texttt{PAY\_0} records the most
-recent payment status (September 2005) and is the single strongest predictor of
-October default, with a Pearson correlation of 0.32 to the target.
+Three hygiene operations run before any feature engineering. EDUCATION codes
+0, 5, and 6 are recoded to 4 (``others''), consistent with the README's
+category for ambiguous responses. MARRIAGE code~0 appears in 54 rows; it is
+recoded to 3 (``others'') by the same logic. Then 35 exact duplicate rows are
+dropped and the index is reset, leaving 29,965 rows.
+
+\subsection{Feature engineering}
+
+Feeding 18 raw temporal columns directly to any model has two costs: it
+multiplies the feature count and introduces strong within-group
+multicollinearity. The six BILL\_AMT columns, for instance, track a single
+underlying credit exposure and correlate with one another above $r = 0.9$.
+Summary statistics capture the same information at a fraction of the dimension.
+
+From the six repayment-status columns we compute three aggregates:
+\texttt{Pay\_delay\_mean} (average months of delay across the six months),
+\texttt{Pay\_delay\_max} (worst single month), and
+\texttt{Pay\_delay\_std} (volatility of the delay pattern). From the six
+bill amounts we compute \texttt{Bill\_mean}, \texttt{Bill\_std}, and
+\texttt{Bill\_max}. From the six payment amounts we compute
+\texttt{Pays\_amts\_total} and \texttt{Pays\_amts\_mean}. We also add
+\texttt{Utilization\_1} (September bill divided by credit limit),
+\texttt{Utilization\_mean} (six-month average utilization),
+\texttt{n\_months\_over\_limit} (count of months where the balance
+exceeded the credit limit, ranging 0--6), and a composite
+\texttt{Risk\_score} defined as
+$\texttt{Pay\_delay\_mean} + \texttt{Utilization\_mean}
++ \texttt{Bill\_mean} / (\texttt{LIMIT\_BAL} + 1)$.
+
+After engineering, all 18 raw temporal columns except \texttt{PAY\_0} are
+dropped. \texttt{PAY\_0} records September 2005 repayment status, is not
+summarised by the engineered features (it is the most recent value, not an
+average), and has the second-highest Pearson correlation with the target
+at $r = 0.325$.
 
 Three engineered columns (\texttt{Pays\_amts\_total}, \texttt{Utilization\_1},
-and \texttt{Risk\_score}) are kept in the saved CSV for interpretability by other
-team members but are excluded from model training. \texttt{Pays\_amts\_total} is
-exactly six times \texttt{Pays\_amts\_mean}; feeding both would introduce a
-perfect linear dependency. \texttt{Utilization\_1} covers a single month and is
-already summarised by \texttt{Utilization\_mean}. \texttt{Risk\_score} is a
-linear combination of features already in the feature set. The final training
-feature matrix has 18 columns.
+and \texttt{Risk\_score}) are kept in the saved CSV for interpretability but
+excluded from training. \texttt{Pays\_amts\_total} equals six times
+\texttt{Pays\_amts\_mean}, creating a perfect linear dependency.
+\texttt{Utilization\_1} covers a single month, already summarised by
+\texttt{Utilization\_mean}. \texttt{Risk\_score} is a linear combination
+of features already in the training set. The final training feature matrix
+has 18 columns.
 
 \subsection{Log transformation of heavy-tailed monetary features}
 
-The autoencoder is trained with mean squared error (MSE) loss. Before
-StandardScaler normalisation, the monetary columns have right-skewed
-distributions: credit limits span from 10,000 to 1,000,000 NT\$, and individual
-bill amounts can reach 964,511 NT\$. After StandardScaler, one training row
-reached $|z| = 72.9$ on a bill column. A single such outlier dominates the
-gradient signal and forces the autoencoder to spend most of its capacity
-reconstructing extreme rows at the cost of typical ones.
+The autoencoder trains under mean squared error (MSE) loss; standard scaler
+normalisation precedes it. Before transformation, the monetary columns are
+severely right-skewed: individual bill amounts reach 964,511~NT\$, and after
+StandardScaler one training row reached $|z| = 72.9$ on a bill column. A
+single such row dominates the gradient and forces the network to waste
+capacity reconstructing extreme rows.
 
 We apply a signed log-plus-one transform,
-$\tilde{x} = \text{sign}(x) \cdot \log(1 + |x|)$,
+\begin{equation}
+  \tilde{x} = \operatorname{sign}(x) \cdot \log(1 + |x|),
+\end{equation}
 to six columns: \texttt{LIMIT\_BAL}, \texttt{Bill\_mean}, \texttt{Bill\_std},
 \texttt{Bill\_max}, \texttt{Pays\_amts\_mean}, and \texttt{Utilization\_mean}.
-The signed form preserves the direction of negative values (negative bills arise
-from refunds, which occur in about 2\% of rows). After transformation and
-StandardScaler, the maximum $|z|$ across all features drops to the range 5--8.
+The signed form preserves the direction of negative bill values, which arise
+from refunds and occur in approximately 2\% of rows. After transformation and
+StandardScaler, the maximum $|z|$ across all features drops to the range
+5--8. The same transformation is applied when the data is used by the
+logistic regression, KNN, and SVM pipelines, so all four models operate on
+identically preprocessed features.
 
 \subsection{Categorical encoding}
 
-SEX, EDUCATION, and MARRIAGE are nominal variables. The autoencoder reconstructs
-each feature under MSE loss, which treats feature values as real numbers on a
-continuous scale. For an ordinal-coded nominal, MSE imposes a false distance
-structure: predicting MARRIAGE $= 2.3$ when the true code is 2 appears as a
-small error even though the two values are semantically unrelated. We one-hot
-encode all three columns with \texttt{drop\_first=True} to avoid perfect
-multicollinearity, adding a net four binary columns (SEX: 1, EDUCATION: 2,
-MARRIAGE: 1). \texttt{PAY\_0} is left numeric because it is genuinely ordinal:
-higher values correspond to longer payment delays.
+SEX, EDUCATION, and MARRIAGE are nominal variables. Treating them as
+ordinal integers and computing MSE on them (as the autoencoder would) imposes
+a false distance structure: predicting MARRIAGE $= 2.3$ when the true code
+is~2 appears as a small error even though the two are semantically unrelated.
+We apply one-hot encoding with \texttt{drop\_first=True} to avoid perfect
+multicollinearity, adding a net four binary columns (one for SEX, two for
+EDUCATION, one for MARRIAGE). \texttt{PAY\_0} is left as a numeric integer
+because its values are genuinely ordinal: higher numbers correspond to longer
+payment delays.
 
-After all preprocessing steps the ML-ready file contains 29,965 rows and 22
-columns (18 features plus the three interpretability-only columns and the target).
+\subsection{Train, calibration, and test splits}
+
+All four model families use the same three-way split. The 29,965-row dataset
+is split 80/20 by stratified random sampling with seed~42, giving a training
+set of 23,972 rows and a test set of 5,993 rows. Both retain the 22.1\%
+default rate. A 10\% calibration slice (2,397 rows, stratified) is carved
+from the training set and held out from model fitting entirely. Its sole use
+is post-hoc probability calibration and threshold selection. After removing
+the calibration slice, the effective training set is 21,575 rows.
+
+For experiments using SMOTE-based oversampling, the balanced file
+\texttt{train\_balanced.csv} (37,336 rows, 50\% default rate) was generated
+by applying SMOTENC to the original training split. SMOTENC, rather than
+plain SMOTE, is used because the one-hot dummy columns (SEX\_2,
+EDUCATION\_2, EDUCATION\_3, EDUCATION\_4, MARRIAGE\_2, MARRIAGE\_3) are
+binary categoricals; interpolating them as continuous values would produce
+fractional dummies such as SEX\_2~$= 0.3$. SMOTENC keeps categorical columns
+at valid binary values during oversampling. The test set and calibration slice
+are never resampled.
 
 %─────────────────────────────────────────────────────────────────────────────
-\section{Model Architecture}
+\section{Exploratory Data Analysis}
 %─────────────────────────────────────────────────────────────────────────────
 
-\subsection{What an autoencoder does}
+\subsection{Target distribution}
 
-An autoencoder is a neural network trained to reproduce its own input at the
-output layer. Internally it passes data through a bottleneck: a hidden layer
-(the \emph{encoder}) with far fewer neurons than the input dimension. Because
-the network must compress the 18-dimensional input through the bottleneck and
-then reconstruct it, the bottleneck neurons are forced to capture the
-information most necessary to represent the data. These bottleneck activations
-are the \emph{latent representation}, and in this project they serve as the
-features fed to XGBoost.
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.55\linewidth]{eda_plots/target_distribution.png}
+  \caption{Class distribution in the preprocessed dataset (29,965 rows).
+           6,628 customers (22.1\%) defaulted; 23,337 (77.9\%) did not.}
+  \label{fig:target_dist}
+\end{figure}
 
-The motivation for this two-stage setup is that XGBoost receives a compact,
-potentially de-noised representation of the input rather than raw correlated
-features. In practice, as the ablation results show, the autoencoder does not
-improve on feeding raw features directly to XGBoost on this dataset, a finding
-we discuss in Section~\ref{sec:analysis}.
+The 78/22 split shown in Figure~\ref{fig:target_dist} is the defining
+constraint of the problem. A classifier that always predicts no-default
+achieves 77.9\% accuracy, a PR-AUC of 0.221 (the positive base rate),
+and a Brier score of $0.221 \times 0.779 = 0.172$. Every model in this
+study must beat these three baselines to contribute meaningful predictive
+power.
 
-\subsection{Autoencoder architecture}
+\subsection{Feature correlations with the target}
 
-The autoencoder maps 18 input features through the sequence
-$18 \to 24 \to 16 \to 10 \to 16 \to 24 \to 18$, where 10 is the bottleneck
-dimension. The encoder path is:
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{eda_plots/correlation_heatmap_full.png}
+  \caption{Pearson correlation heatmap over all 22 columns of the ML-ready
+           dataset (including interpretability-only columns and the target).
+           The monetary engineered features cluster into a block of high
+           mutual correlation (upper-left), while the payment-delay aggregates
+           form a separate block with strong positive correlation to
+           \texttt{default\_payment} (lower-right diagonal).}
+  \label{fig:corr_full}
+\end{figure}
 
-\begin{center}
-\begin{tabular}{lll}
+Table~\ref{tab:correlations} ranks the 21 features by their Pearson
+correlation with \texttt{default\_payment}. Three findings stand out.
+
+\begin{table}[H]
+\centering
+\caption{Pearson correlation of each feature with \texttt{default\_payment},
+         ranked by absolute magnitude. Values computed on the full 29,965-row
+         preprocessed dataset.}
+\label{tab:correlations}
+\small
+\begin{tabular}{lrl}
 \toprule
-Layer & Units & Activation \\
+Feature & $r$ & Direction \\
 \midrule
-Input       & 18 & -- \\
-Dense       & 24 & ReLU \\
-Dropout     & -- & 0.2 drop rate \\
-Dense       & 16 & ReLU \\
-Dropout     & -- & 0.2 drop rate \\
-Dense (bottleneck) & 10 & ReLU \\
+Pay\_delay\_max    & $+0.331$ & More delay in worst month $\to$ higher default risk \\
+PAY\_0             & $+0.325$ & September payment status is the strongest raw predictor \\
+Pay\_delay\_mean   & $+0.282$ & Higher average delay $\to$ higher default risk \\
+Pay\_delay\_std    & $+0.249$ & Irregular payers default more than steady ones \\
+Risk\_score        & $+0.239$ & Linear composite; not used in training \\
+Utilization\_mean  & $+0.112$ & Consistently high balance relative to credit limit \\
+Utilization\_1     & $+0.086$ & Single-month version; lower than the mean \\
+n\_months\_over\_limit & $+0.076$ & Counting over-limit months adds a small signal \\
+\midrule
+LIMIT\_BAL         & $-0.174$ & Higher credit limit granted to lower-risk customers \\
+Pays\_amts\_mean   & $-0.155$ & Larger payments correlate with lower default rate \\
+Bill\_std          & $-0.143$ & Stable bills predict non-default \\
+Bill\_mean         & $-0.047$ & Mean bill is nearly uncorrelated once delay is accounted for \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-The decoder mirrors the encoder (Dense 16, Dense 24, Dense 18 with linear
-activation). The output layer uses a linear activation because the targets are
-continuous real values (StandardScaler outputs), not bounded to $[0, 1]$. The
-network is trained with Adam and MSE loss, with early stopping on the validation
-loss (patience = 5, restoring best weights).
+First, payment delay dominates: the three delay aggregates
+(\texttt{Pay\_delay\_max}, \texttt{Pay\_delay\_mean}, \texttt{Pay\_delay\_std})
+and \texttt{PAY\_0} together account for the four strongest individual
+correlations, all above $r = 0.25$. Second, higher credit limits
+(\texttt{LIMIT\_BAL}, $r = -0.174$) and higher average payments
+(\texttt{Pays\_amts\_mean}, $r = -0.155$) both predict non-default.
+Banks issue larger credit limits to less risky customers; this is a
+selection effect, not a causal protection. Third, AGE has a correlation
+of $r = +0.014$, essentially zero; age will not contribute much predictive
+power in any of the four models.
 
-\subsection{Weighted autoencoder loss (B.4)}
+\subsection{Distributional characteristics of key features}
 
-A class-blind MSE autoencoder reconstructs whatever the training distribution
-presents. Because 78\% of training rows are non-defaulters, the autoencoder
-implicitly allocates most of its capacity to reconstructing that majority. We
-address this by passing \texttt{sample\_weight} to \texttt{autoencoder.fit}: each
-defaulter row is up-weighted by $\frac{N_{\text{non-default}}}{N_{\text{default}}}
-\approx 3.52$, the inverse class ratio. This forces the network to pay equal
-attention to both classes in MSE terms, at no cost beyond one extra argument.
-The ablation (Conditions C2 vs.\ C3) shows the effect is marginal: 0.0018
-PR-AUC difference, within measurement noise.
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{eda_plots/credit_limit_distribution.png}
+    \caption{Credit limit distribution (signed-log scale).}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{eda_plots/pay0_distribution.png}
+    \caption{PAY\_0 (September payment status) distribution.}
+  \end{subfigure}
+  \caption{Two of the most informative features. After signed-log transformation,
+           credit limits are approximately normally distributed. PAY\_0 is
+           heavily concentrated at $-1$ and $0$ (on-time or revolving payment),
+           with a long right tail of delayed payers.}
+  \label{fig:key_features}
+\end{figure}
 
-\subsection{PAY\_0 concatenation (C.3)}
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{eda_plots/engineered_features_distributions.png}
+  \caption{Histograms of the six engineered features before log transformation.
+           Pay\_delay\_mean and Pay\_delay\_max are concentrated near zero with
+           long right tails. Bill\_mean and Pays\_amts\_mean are right-skewed;
+           the log transform applied in preprocessing tames both to
+           approximately normal shapes before scaling.}
+  \label{fig:eng_features}
+\end{figure}
 
-After encoding, we concatenate the scaled raw value of \texttt{PAY\_0} to the
-10-dimensional latent vector, giving XGBoost an 11-dimensional input. The
-rationale is that \texttt{PAY\_0} is the strongest predictor ($r = 0.32$), and
-an autoencoder bottleneck of dimension 10 compressing 18 features may not
-preserve this signal with full fidelity. Bypassing the bottleneck for this one
-feature avoids that loss. The ablation confirms this matters: Condition C4
-(latents only, no PAY\_0) achieves PR-AUC = 0.5123, the worst AE variant,
-while C2 with PAY\_0 concatenated reaches 0.5217.
+Figure~\ref{fig:key_features}(a) shows the credit limit distribution on the
+signed-log scale applied by preprocessing. The original distribution spans
+10,000 to 1,000,000~NT\$ and is right-skewed; after $\tilde{x} = \log(1+|x|)$
+the distribution is approximately symmetric, with maximum $|z| \approx 5$
+after StandardScaler.
 
-\subsection{XGBoost}
+Figure~\ref{fig:key_features}(b) shows \texttt{PAY\_0}. The value $-1$
+(payment made on time) accounts for most rows; $-2$ (credit card paid in
+full) is the second most common. Positive values from 1 to 8 represent
+months of delay and together account for approximately 26\% of rows, a
+fraction that is larger than the 22.1\% default rate, meaning some delayed
+payers still did not default in October 2005.
 
-XGBoost is a gradient-boosted decision tree ensemble. It builds a sequence of
-shallow trees, where each tree is trained to correct the residual errors of the
-previous ensemble, and the final prediction is the sum of all trees' outputs
-passed through a logistic function. ``Gradient boosting'' refers to fitting each
-new tree to the gradient of the loss function with respect to the current
-prediction.
+\subsection{Group differences between defaulters and non-defaulters}
 
-For class imbalance, XGBoost provides \texttt{scale\_pos\_weight}: when set to
-$w$, the positive-class gradient and hessian are multiplied by $w$, making each
-positive example count as $w$ negative examples during tree construction. We
-set $w = 3.52$.
+Table~\ref{tab:group_summary} compares group means on the signed-log scale.
+Defaulters carry lower credit limits, higher utilization, positive average
+payment delay (non-defaulters have negative mean delay, i.e., they tend to
+pay early), and a Risk\_score more than three times that of non-defaulters.
 
-We tune four hyperparameters via grid search: the number of trees
-(200 or 400), tree depth (4 or 6), learning rate (0.05 or 0.10), and minimum
-child weight (1 or 3). This gives 16 combinations. Each combination is evaluated
-by 5-fold stratified cross-validation, scored on average precision (the area
-under the precision-recall curve on the held-out fold). The grid consistently
-selects shallow trees (max\_depth = 4), a conservative learning rate (0.05),
-and the smaller tree count (200 estimators) across nearly all conditions and
-seeds.
+\begin{table}[H]
+\centering
+\caption{Mean feature values by default status (signed-log scale).
+         LIMIT\_BAL and monetary columns were transformed before these means
+         are computed; they are not in NT\$ units.}
+\label{tab:group_summary}
+\small
+\begin{tabular}{lrr}
+\toprule
+Feature & Non-defaulters (78\%) & Defaulters (22\%) \\
+\midrule
+LIMIT\_BAL (log)     & 11.75 & 11.36 \\
+Bill\_mean (log)     &  9.41 &  9.10 \\
+Pays\_amts\_mean (log) & 7.69 & 6.93 \\
+Utilization\_mean (log) & 0.271 & 0.338 \\
+Pay\_delay\_mean     & $-0.328$ & $+0.338$ \\
+Risk\_score          &  0.375 &  1.238 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\subsection{Probability calibration (D.2)}
+The most striking contrast is in \texttt{Pay\_delay\_mean}: non-defaulters
+average $-0.328$ (skewed toward early payment) while defaulters average
+$+0.338$ (skewed toward delayed payment), a gap of 0.666 in the log-scale
+units. Risk\_score, as a linear composite of delay and utilization features,
+shows a $3.3\times$ gap between groups (0.375 vs.\ 1.238).
 
-\texttt{scale\_pos\_weight} upweights the positive class during training, which
-inflates the raw \texttt{predict\_proba} outputs: a score of 0.5 from a model
-trained with $w = 3.52$ does not correspond to a 50\% probability of default.
-Without correction, the Brier score (which depends on probability values, not
-rankings) is meaningless.
-
-We apply isotonic regression calibration using
-\texttt{CalibratedClassifierCV(method='isotonic', cv='prefit')} on a 10\%
-calibration slice carved from the training set before the autoencoder is
-trained. Isotonic regression fits a non-decreasing step function mapping raw
-model scores to empirical probabilities on the calibration data. The calibration
-slice is held out from both the autoencoder's training and GridSearchCV's folds,
-so the calibrator cannot overfit to data it has already influenced.
-
-\subsection{Threshold selection (D.1)}
-
-Binary predictions require a decision threshold: output 1 if
-$P(\text{default}) \geq \tau$, else 0. The default $\tau = 0.5$ is wrong for
-two reasons. First, after calibration the probabilities are honest but the
-optimal operating point is problem-dependent, not always 0.5. Second, for a
-22\%-positive dataset, the F1-maximising threshold is typically well below 0.5.
-
-We select $\tau^*$ by computing the F1 score at every threshold on calibrated
-calibration-slice predictions and taking the argmax:
-\[
-  \tau^* = \arg\max_\tau \, F1(\tau, \text{cal set})
-\]
-Using the calibration slice for this search prevents test-set leakage: $\tau^*$
-is fixed before the test set is touched.
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{eda_plots/correlation_heatmap_engineered.png}
+  \caption{Correlation matrix among the six engineered features and the
+           target. Pay\_delay\_mean and Risk\_score correlate at $r = 0.92$
+           (the Risk\_score is partly constructed from Pay\_delay\_mean),
+           confirming that both would provide nearly identical information in
+           a model. Only Pay\_delay\_mean enters the training features;
+           Risk\_score is kept in the CSV for interpretability.}
+  \label{fig:corr_eng}
+\end{figure}
 
 %─────────────────────────────────────────────────────────────────────────────
-\section{Evaluation Metrics}
+\section{Evaluation Protocol}
+\label{sec:eval}
 %─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Why ROC-AUC is not the primary metric}
+All four model families use an identical evaluation protocol to ensure the
+results are comparable.
 
-The receiver operating characteristic (ROC) curve plots true positive rate
-against false positive rate at every threshold. Its area (ROC-AUC) equals the
-probability that a randomly drawn positive example is ranked above a randomly
-drawn negative example. For a balanced dataset, ROC-AUC is informative. For an
-imbalanced one, it can be misleading: a classifier that predicts ``no default''
-for every row achieves a true positive rate of 0 and a false positive rate of 0,
-which lies on the ROC diagonal and yields ROC-AUC close to 0.5. But it correctly
-classifies all 78\% non-defaulters and fails on all 22\% defaulters. The metric
-obscures this failure. We report ROC-AUC for reference only.
+\subsection{PR-AUC as the primary metric}
 
-\subsection{Precision-Recall AUC (primary metric)}
+The precision-recall (PR) curve plots precision
+($TP / (TP + FP)$) against recall ($TP / (TP + FN)$) as the decision
+threshold varies. PR-AUC is the area under this curve. For a dataset with
+22.1\% positive rate, a classifier that randomly ranks examples achieves
+PR-AUC $\approx 0.221$; a perfect ranker achieves 1.0.
 
-The precision-recall (PR) curve plots precision ($\frac{TP}{TP+FP}$) against
-recall ($\frac{TP}{TP+FN}$) at every threshold. PR-AUC is the area under this
-curve. For an imbalanced problem, PR-AUC is more informative because precision
-directly reflects how often a positive prediction is correct, regardless of how
-many true negatives exist. A trivial all-negative classifier achieves
-PR-AUC $\approx 0.22$ (the positive base rate) while a perfect classifier
-achieves 1.0. All of our conditions score in the range 0.49--0.53, modest
-improvement over the 0.22 baseline but well short of perfect discrimination.
+We prefer PR-AUC over ROC-AUC because the ROC curve is built from the true
+positive rate and the false positive rate, and the false positive rate is
+diluted by the large pool of true negatives in an imbalanced dataset. A model
+that flags 10\% of the 77.9\% majority class as false positives accumulates
+many misclassified customers, yet its false positive rate ($FP / (FP+TN)$)
+remains small because the denominator (all non-defaulters) is large. PR-AUC
+exposes this by measuring precision directly.
 
 \subsection{Brier score}
 
 The Brier score is the mean squared error of predicted probabilities:
 \[
-  \text{Brier} = \frac{1}{N}\sum_{i=1}^N (p_i - y_i)^2
+  \text{Brier} = \frac{1}{N}\sum_{i=1}^N (p_i - y_i)^2.
 \]
-where $p_i$ is the model's predicted probability and $y_i \in \{0, 1\}$ is the
-true label. Lower is better. A model that always predicts the base rate
-($p_i = 0.221$) achieves Brier $= 0.221 \times 0.779 = 0.172$. Our conditions
-score between 0.135 and 0.140, beating this naive baseline. Brier score requires
-well-calibrated probabilities; without isotonic calibration, the scores would be
-inflated by \texttt{scale\_pos\_weight}.
+A model that always predicts the base rate ($p_i = 0.221$) achieves
+Brier $= 0.221 \times 0.779 = 0.172$. Our models score between 0.135 and
+0.200, where lower values indicate better-calibrated probabilities.
+Brier score requires well-calibrated outputs; without post-hoc calibration
+the scores would reflect the raw skewed distributions produced by
+class-imbalance corrections.
 
-\subsection{F1 at the optimal threshold}
+\subsection{Calibration and threshold selection}
 
-F1 is the harmonic mean of precision and recall, $F1 = \frac{2 \cdot P \cdot R}{P + R}$.
-Unlike PR-AUC, it depends on a fixed threshold. We report $F1@\tau^*$: the F1
-score measured on the test set using the threshold $\tau^*$ selected on the
-calibration slice. Because $\tau^*$ is tuned rather than fixed at 0.5, the score
-reflects realistic operating performance rather than an arbitrary operating point.
+All four pipelines apply the same two-step post-processing. First, isotonic
+regression calibration (\texttt{CalibratedClassifierCV(method='isotonic',
+cv='prefit')}) is fitted on the held-out calibration slice. Isotonic
+regression fits a non-decreasing step function mapping raw model scores to
+empirical probabilities on the calibration data. Second, the F1-optimal
+threshold is found on the calibration slice:
+\[
+  \tau^* = \arg\max_\tau \, F1(\tau, \text{calibration set}).
+\]
+This threshold is then applied to the test set. Using the calibration slice
+for threshold selection prevents test-set leakage.
 
-\subsection{Accuracy}
-
-Accuracy is the fraction of correct predictions. We report it for completeness,
-but it is a poor summary of performance for a 22\%-positive dataset. A model
-that predicts ``no default'' for every row achieves 77.9\% accuracy, which is
-higher than some of our conditions' accuracy figures. The numbers in the results
-table are accuracy at $\tau^*$, not at 0.5.
+For a 22\%-positive dataset the F1-optimal threshold is typically well below
+0.5: the model needs to flag more positives to recover enough true positives
+to push recall up, at the cost of some precision. All conditions in this
+study find $\tau^*$ in the range 0.15--0.71, with the unbalanced conditions
+clustering around 0.15--0.38.
 
 %─────────────────────────────────────────────────────────────────────────────
-\section{Experiment Design}
+\section{Model Architectures and Methodology}
+\label{sec:method}
 %─────────────────────────────────────────────────────────────────────────────
 
-We compare seven conditions, each run with three random seeds (seeds 0, 1, 2).
-All conditions share the same 80/20 stratified train/test split (seed = 42), the
-same 10\% calibration slice, the same 16-cell XGBoost grid, and the same
-calibration and threshold-tuning protocol. Table~\ref{tab:conditions} defines
-each condition and what it isolates.
+\subsection{Autoencoder + XGBoost}
 
-\begin{table}[h]
+\subsubsection*{Autoencoder architecture and training}
+
+An autoencoder is a neural network trained to reproduce its own input at
+the output layer through a low-dimensional bottleneck. The encoder
+compresses the input; the decoder reconstructs it. Because the network
+cannot copy the input through a narrower channel without losing information,
+the bottleneck neurons learn to retain the information most relevant for
+reconstruction. Those bottleneck activations, called the latent
+representation, replace the original features as input to XGBoost.
+
+The architecture used here maps $18 \to 24 \to 16 \to 10 \to 16 \to 24 \to 18$,
+with ReLU activations on all hidden layers, Dropout (rate 0.2) after each
+encoder hidden layer, and a linear activation on the output layer. The output
+is linear because StandardScaler outputs are real-valued, not bounded to
+$[0,1]$. The network is trained with Adam and MSE loss, with early stopping
+on the validation loss (patience~$= 5$, restoring best weights).
+
+Two design modifications improve the default class-blind training setup.
+\emph{Weighted AE loss} (Condition B.4): because 78\% of training rows are
+non-defaulters, a class-blind autoencoder allocates most of its reconstruction
+capacity to the majority class. We pass \texttt{sample\_weight} to
+\texttt{autoencoder.fit}, upweighting each defaulter row by the inverse class
+ratio $N_{\text{non-default}}/N_{\text{default}} \approx 3.52$. The ablation
+(Section~\ref{sec:ae_ablation}) shows this changes PR-AUC by only 0.0018,
+which is within measurement noise at three seeds. \emph{PAY\_0 concatenation}
+(Condition C.3): after encoding, the scaled raw value of \texttt{PAY\_0} is
+concatenated to the 10-dimensional latent vector, giving XGBoost an
+11-dimensional input. The ablation shows this matters more: removing it
+reduces PR-AUC by 0.0094.
+
+\subsubsection*{XGBoost configuration}
+
+XGBoost builds a sequence of shallow decision trees where each tree corrects
+the residuals of the previous ensemble. The final prediction is the sum of
+all trees' outputs passed through a logistic function.
+
+For the imbalance, XGBoost's \texttt{scale\_pos\_weight} multiplies the
+gradient contribution of each positive-class example by a factor $w$. We
+set $w = 3.52$. Hyperparameter tuning uses a 16-cell grid (2 choices each
+for number of estimators, tree depth, learning rate, and minimum child
+weight) evaluated by 5-fold stratified cross-validation scored on
+average precision. The grid consistently selects \texttt{max\_depth}~$= 4$,
+\texttt{learning\_rate}~$= 0.05$, and \texttt{n\_estimators}~$= 200$ across
+nearly all conditions and seeds.
+
+\subsection{Logistic Regression with PCA}
+
+Logistic regression fits a linear decision boundary by learning one weight
+per feature. The model predicts $P(\text{default}) = \sigma(\mathbf{w}^T
+\mathbf{x} + b)$ where $\sigma$ is the logistic function. Because this
+is a linear model, feature coefficients are directly interpretable: a
+positive coefficient on \texttt{Pay\_delay\_mean} means higher average
+delay increases the log-odds of default by that coefficient per unit of
+the standardised feature.
+
+Logistic regression naturally produces calibrated probabilities through
+its link function, so the Brier score is meaningful without additional
+isotonic calibration. The same threshold-tuning protocol applies.
+
+PCA (principal component analysis) transforms the standardised features
+into orthogonal directions of maximum variance. We retain the components
+needed to explain 95\% of the total variance, which reduces 18 features
+to 13 principal components. PCA does not use label information; it is
+fitted on the training set and applied to calibration and test sets.
+
+Six conditions are tested: original features vs.\ PCA, each crossed with
+three class-imbalance strategies (no adjustment, \texttt{class\_weight=
+'balanced'}, and SMOTENC oversampling).
+
+\subsection{UMAP + k-Nearest Neighbours}
+
+UMAP (Uniform Manifold Approximation and Projection) is a nonlinear
+dimensionality reduction algorithm. Unlike PCA, which finds directions of
+maximum variance in the original feature space, UMAP constructs a
+weighted graph capturing the topology of the data's neighbourhood structure
+and then finds a low-dimensional layout that preserves that topology.
+Concretely, UMAP builds a fuzzy simplicial set representation based on local
+distances (controlled by \texttt{n\_neighbors}, which sets the neighbourhood
+size) and minimises the cross-entropy between high-dimensional and
+low-dimensional fuzzy sets.
+
+We project to 2 dimensions with \texttt{n\_neighbors}~$= 15$ and
+\texttt{min\_dist}~$= 0.1$ using Euclidean distance. The 2D projection is
+used both for classification (as input to KNN) and for visualisation
+(Figures~\ref{fig:umap_class}--\ref{fig:umap_compare}).
+
+k-Nearest Neighbours classifies a test point by majority vote among its
+$k$ nearest training neighbours. The predicted probability is the fraction
+of the $k$ neighbours that belong to the positive class. Hyperparameters
+are tuned by 3-fold stratified cross-validation over $k \in \{5, 11, 15, 21,
+31\}$, weights in \{uniform, distance\}, and distance metric in
+\{Euclidean, Manhattan\}, scored on F1.
+
+Four conditions are tested: original 18 features vs.\ 2D UMAP, each with
+and without SMOTENC oversampling.
+
+\subsection{SVM with LDA}
+
+A support vector machine with an RBF kernel finds a decision boundary that
+maximises the margin between classes in a kernel-induced feature space. The
+RBF kernel implicitly maps the input into a high-dimensional space where
+classes that are not linearly separable in 18D may become separable. We
+use \texttt{SVC(kernel='rbf', probability=True, C=1.0, gamma='scale')},
+which enables probability outputs through Platt scaling (fitting a logistic
+regression on the SVM decision values on a held-out subset of training data).
+No hyperparameter search is performed; $C = 1$ and \texttt{gamma='scale'}
+(set to $1/(n\_\text{features} \times \text{Var}(\mathbf{X}))$) are used
+directly.
+
+Linear Discriminant Analysis (LDA) finds the projection direction that
+maximises the ratio of between-class variance to within-class variance. For
+binary classification, LDA reduces to a single discriminant direction,
+projecting 18 features to 1 scalar. This is the most aggressive compression
+tested in the study: 18 features collapsed to 1.
+
+Four conditions are tested: original 18 features vs.\ 1D LDA projection,
+each with and without SMOTENC oversampling.
+
+%─────────────────────────────────────────────────────────────────────────────
+\section{Experiments and Results}
+\label{sec:results}
+%─────────────────────────────────────────────────────────────────────────────
+
+\subsection{AE + XGBoost ablation}
+\label{sec:ae_ablation}
+
+Seven conditions isolate the contribution of each architectural choice.
+Table~\ref{tab:ae_conditions} describes each condition, and
+Table~\ref{tab:ae_results} reports the mean and standard deviation across
+three seeds.
+
+\begin{table}[H]
 \centering
-\caption{Ablation conditions.}
-\label{tab:conditions}
+\caption{AE+XGBoost ablation conditions. C0 and C1 bypass the autoencoder
+         entirely and feed raw features to XGBoost; they serve as the
+         baseline against which AE variants are measured.}
+\label{tab:ae_conditions}
 \begin{tabularx}{\textwidth}{llX}
 \toprule
-ID & Configuration & What it isolates \\
+ID & Configuration & Design choice under test \\
 \midrule
-C0 & XGB-only, $w = 3.52$ & XGB on raw 18 features, with imbalance correction \\
-C1 & XGB-only, $w = 1$ & XGB on raw features, no imbalance correction \\
-C2 & AE + XGB, weighted AE, PAY\_0 concat & Full current model (B.4 and C.3 active) \\
-C3 & AE + XGB, class-blind AE, PAY\_0 concat & Effect of weighted AE loss (B.4) \\
-C4 & AE + XGB, weighted AE, latents only & Effect of PAY\_0 concatenation (C.3) \\
+C0 & XGB-only, $w = 3.52$ & XGBoost on 18 raw features, with imbalance weight \\
+C1 & XGB-only, $w = 1$    & XGBoost on 18 raw features, no imbalance weight \\
+C2 & AE + XGB, weighted AE, PAY\_0 concat & Full AE pipeline (B.4 and C.3 active) \\
+C3 & AE + XGB, class-blind AE, PAY\_0 concat & Weighted AE loss (B.4) \\
+C4 & AE + XGB, weighted AE, latents only & PAY\_0 concatenation (C.3) \\
 C5 & AE + XGB, SMOTE on latents, $w = 1$ & Latent-space oversampling vs.\ $w$ \\
 C6 & AE + XGB, Borderline-SMOTE on latents, $w = 1$ & Boundary-aware oversampling \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-For C0 and C1, XGBoost receives the 18 standardised raw features directly,
-bypassing the autoencoder entirely. C0 uses \texttt{scale\_pos\_weight} = 3.52;
-C1 sets it to 1 (no correction). These two conditions are the baseline against
-which all AE variants are measured.
-
-Conditions C2, C3, and C4 share the same autoencoder architecture (encoding\_dim
-= 10) and differ only in training weight and feature concatenation:
-\begin{itemize}
-  \item C2 uses the weighted AE loss (B.4) and concatenates PAY\_0.
-  \item C3 removes the weight (class-blind AE) but keeps PAY\_0 concatenation.
-  \item C4 uses the weighted AE but does not concatenate PAY\_0.
-\end{itemize}
-
-C5 and C6 replace \texttt{scale\_pos\_weight} with synthetic oversampling applied
-to the 10-dimensional latent space after encoding. C5 uses plain SMOTE, which
-generates new minority samples by interpolating between existing ones in latent
-space. C6 uses Borderline-SMOTE, which restricts synthetic sample generation to
-latent vectors near the decision boundary. Both C5 and C6 use $w = 1$ to avoid
-double-correcting for imbalance.
-
-Three outer seeds per condition give 21 total runs. With only three seeds the
-standard deviation estimate itself carries roughly 50\% relative error; a
-difference smaller than one standard deviation cannot be treated as a reliable
-ranking.
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Results}
-%─────────────────────────────────────────────────────────────────────────────
-
-Table~\ref{tab:results} reports the mean and standard deviation of each metric
-across three seeds. The primary metric is PR-AUC.
-
-\begin{table}[h]
+\begin{table}[H]
 \centering
-\caption{Benchmark results: mean $\pm$ std across 3 seeds. Primary metric: PR-AUC.}
-\label{tab:results}
+\caption{AE+XGBoost benchmark results: mean $\pm$ std across 3 seeds.
+         Primary metric: PR-AUC. Train time is the wall-clock mean in
+         seconds; it does not include grid search overhead.}
+\label{tab:ae_results}
 \small
-\begin{tabular}{lrrrrrrl}
+\begin{tabular}{lrrrrrrr}
 \toprule
-Cond. & PR-AUC & Brier & F1@$\tau^*$ & Accuracy & ROC-AUC & $\tau^*$ & Train (s) \\
+Cond. & PR-AUC & Brier & F1@$\tau^*$ & Accuracy & ROC-AUC & $\tau^*$ & Train(s) \\
 \midrule
 C0 & $0.5281 \pm 0.0065$ & $0.1350 \pm 0.0011$ & $0.5465 \pm 0.0054$ & $0.7959 \pm 0.0155$ & $0.7820 \pm 0.0077$ & 0.336 & 31 \\
 C1 & $0.5280 \pm 0.0107$ & $0.1349 \pm 0.0011$ & $0.5463 \pm 0.0061$ & $0.7958 \pm 0.0150$ & $0.7831 \pm 0.0069$ & 0.343 & 31 \\
@@ -398,200 +597,630 @@ C6 & $0.4933 \pm 0.0029$ & $0.1398 \pm 0.0011$ & $0.5325 \pm 0.0051$ & $0.7581 \
 \end{tabular}
 \end{table}
 
-The top condition by PR-AUC is C0 at $0.5281 \pm 0.0065$. Four conditions are
-within one standard deviation of C0: C1, C3, and C2. With only three seeds,
-these four should be treated as statistically indistinguishable. The remaining
-three conditions (C4, C5, C6) sit below one standard deviation from C0.
+\paragraph{XGB-only vs.\ AE+XGB.}
+C0 (PR-AUC~$= 0.5281$) and C1 (0.5280) both outperform every AE variant.
+The best AE condition, C2, reaches 0.5217, a gap of 0.006 below C0. This
+gap is small but consistent across all three seeds. The autoencoder is not
+improving the feature representation on this dataset. The probable cause is
+that the 18-feature dataset's monetary columns are highly collinear ($r > 0.9$
+within the bill-amount group), leaving little non-linear structure for the
+encoder to discover. A direct test confirms this: a 2-neuron bottleneck
+achieves near-identical ROC-AUC to the 10-neuron bottleneck, which means
+the autoencoder is performing the equivalent of PCA-style linear projection,
+not learning a useful non-linear manifold.
 
-The $\tau^*$ column shows the F1-optimal threshold found on the calibration
-slice. All conditions land in the range 0.28--0.34, well away from 0.5. The
-isotonic calibration is functioning correctly: if calibration had failed and
-raw scores were passed through, $\tau^*$ would be near 0.5 for the XGB-only
-conditions and near 0 or 1 for the AE conditions. The AE conditions tend to
-have lower $\tau^*$ (0.28--0.32) than the XGB-only conditions (0.34--0.34),
-reflecting the different probability scales produced by the two model types
-before calibration.
+\paragraph{PAY\_0 concatenation.}
+C4 (latents only, no PAY\_0) achieves PR-AUC~$= 0.5123$, the weakest AE
+variant, 0.0094 below C2 (0.5217). The bottleneck of 10 neurons compressing
+18 features loses \texttt{PAY\_0}'s signal ($r = 0.325$ with target). Bypassing
+the bottleneck by concatenating the raw scaled \texttt{PAY\_0} value directly
+to the latent vector recovers 0.0094 PR-AUC. This is the most concrete
+design decision the ablation validates.
 
-Training time is 31 seconds for all conditions that do not apply oversampling.
-SMOTE (C5) adds 13 seconds and Borderline-SMOTE (C6) adds 23 seconds. The
-autoencoder itself is not a bottleneck; at 21,572 training rows and 50 epochs
-with early stopping, it fits in under 5 seconds on GPU.
+\paragraph{Weighted AE loss.}
+C2 (weighted AE, PR-AUC~$= 0.5217$) vs.\ C3 (class-blind AE, 0.5235) shows
+a difference of 0.0018 in favour of the class-blind AE. This is less than the
+standard deviation of either condition and reverses direction between conditions,
+indicating it is noise. Weighted AE loss has no measurable effect at this dataset
+size and seed count.
 
-%─────────────────────────────────────────────────────────────────────────────
-\section{Analysis of Individual Conditions}
-\label{sec:analysis}
-%─────────────────────────────────────────────────────────────────────────────
+\paragraph{Latent-space oversampling.}
+SMOTE on latents (C5, PR-AUC~$= 0.5177$) beats C4 (latents only, 0.5123)
+by 0.0054 but remains below C0 and C2. Borderline-SMOTE (C6, 0.4933)
+is the worst condition overall. Borderline-SMOTE restricts synthetic sample
+generation to latent vectors near the decision boundary. In a low-variance
+10-dimensional latent space, boundary points from both classes are close
+together, so the synthetic samples are noisy rather than informative.
+Borderline-SMOTE costs 54 seconds of training versus 31 for the non-oversampling
+conditions, with a PR-AUC penalty of 0.035 relative to C0.
 
-\subsection{XGB-only beats every AE variant (C0, C1 vs.\ C2--C6)}
+\paragraph{scale\_pos\_weight sensitivity.}
+C0 ($w = 3.52$, PR-AUC~$= 0.5281$) vs.\ C1 ($w = 1$, 0.5280) differ by
+0.0001 on PR-AUC and 0.0001 on Brier. XGBoost on raw features with 5-fold
+cross-validation scored on average precision does not need the explicit
+class weight; the scoring criterion already prioritises the minority class.
 
-The best AE variant (C2: 0.5217) underperforms both XGB-only conditions (C0:
-0.5281, C1: 0.5280) by 0.006 PR-AUC. This gap is small but consistent across
-all three seeds. The autoencoder is adding information loss, not information
-gain.
+\subsection{Logistic Regression results}
 
-The likely cause is that the 18-feature dataset has high multicollinearity among
-monetary columns, leaving little genuine non-linear structure for the autoencoder
-to exploit. A direct empirical check supports this: a 2-neuron bottleneck trained
-for 150 epochs achieves near-identical ROC-AUC to the 10-neuron bottleneck. When
-a bottleneck that small can represent the data nearly as well as a 10-neuron one,
-the autoencoder is performing PCA-equivalent linear compression, not capturing a
-useful non-linear manifold. The model family is fixed by the project constraints;
-this result is reported honestly.
+Table~\ref{tab:lr_results} shows all six logistic regression conditions.
+No hyperparameter tuning beyond threshold selection was applied.
 
-\subsection{PAY\_0 concatenation is load-bearing (C4 vs.\ C2)}
-
-Removing the PAY\_0 concatenation (C4: 0.5123) produces the worst AE variant,
-0.0094 PR-AUC below C2 (0.5217). The AE bottleneck loses the strongest
-predictor's signal, and without it XGBoost has to recover that information
-indirectly from whatever the latent dimensions encode. It cannot fully compensate.
-This is the most concrete design decision the ablation validates.
-
-\subsection{Weighted AE loss has marginal effect (C2 vs.\ C3)}
-
-C2 (weighted AE) scores 0.5217 vs.\ C3 (class-blind AE) at 0.5235. The
-difference of 0.0018 is less than the standard deviation of either condition
-(0.0046 and 0.0059, respectively) and is not distinguishable at three seeds.
-Weighted AE loss is free to keep because it costs nothing at inference time and
-has a principled motivation, but it is not the deciding factor.
-
-\subsection{scale\_pos\_weight is not the lever for XGB-only (C0 vs.\ C1)}
-
-C0 (with $w = 3.52$) scores 0.5281 and C1 (with $w = 1$) scores 0.5280 on
-PR-AUC, a difference of 0.0001. The identical Brier scores (0.1350 vs.\ 0.1349)
-confirm the two conditions are functionally the same. XGBoost does not require the imbalance correction on this dataset when
-operating on raw features. The tree structure and PR-AUC scoring in
-GridSearchCV already orient the model toward the minority class without
-the explicit weight.
-
-\subsection{Latent-space oversampling does not help (C5, C6)}
-
-SMOTE on latents (C5: 0.5177) is slightly below the class-blind XGB baseline
-C4 (0.5123 is C4; C5 improves on C4 slightly but both fall below C0/C1).
-Borderline-SMOTE (C6: 0.4933) is the worst condition overall, 0.035 PR-AUC
-below C0. Borderline-SMOTE restricts synthetic sample generation to latent
-vectors near the classification boundary, which in a low-variance latent space
-like this one means interpolating between points that are already near the
-boundary on both sides, producing noisy synthetic samples that damage the
-classifier's decision surface.
-
-Plain SMOTE is neutral to mildly negative; Borderline-SMOTE is harmful.
-Neither is recommended for this pipeline.
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Single-Run Kaggle Notebook Results}
-%─────────────────────────────────────────────────────────────────────────────
-
-The Kaggle notebook (\texttt{model.py}) was run at \texttt{encoding\_dim = 4}
-(a deviation from the benchmark's \texttt{encoding\_dim = 10}). The results
-from that run were:
-
-\begin{center}
-\begin{tabular}{ll}
+\begin{table}[H]
+\centering
+\caption{Logistic Regression results. PCA retains 95\% of variance (13 components
+         from 18 features). The C0 XGB-only row is reproduced for cross-model
+         reference.}
+\label{tab:lr_results}
+\small
+\begin{tabular}{lrrrrrrl}
 \toprule
-Metric & Value \\
+Condition & PR-AUC & Brier & F1@$\tau^*$ & Accuracy & ROC-AUC & $\tau^*$ & Feat. \\
 \midrule
-Best CV PR-AUC & 0.5425 \\
-PR-AUC (test) & 0.5152 \\
-Brier score & 0.1390 \\
-F1 @ $\tau^* = 0.399$ & 0.5176 \\
-Accuracy & 0.787 \\
-ROC-AUC & 0.762 \\
+original             & 0.5087 & 0.1423 & 0.5183 & 0.7934 & 0.7458 & 0.319 & 18 \\
+original\_PCA        & 0.5031 & 0.1428 & 0.5277 & 0.7906 & 0.7470 & 0.319 & 13 \\
+balanced\_cw         & 0.4969 & 0.1960 & 0.5272 & 0.7812 & 0.7495 & 0.577 & 18 \\
+balanced\_cw\_PCA    & 0.4941 & 0.1969 & 0.5275 & 0.7809 & 0.7497 & 0.593 & 13 \\
+smote                & 0.4870 & 0.1937 & 0.4965 & 0.7597 & 0.7227 & 0.543 & 18 \\
+smote\_PCA           & 0.4851 & 0.2002 & 0.4945 & 0.7322 & 0.7269 & 0.522 & 13 \\
+\midrule
+\textit{C0 XGB (ref.)} & \textit{0.5281} & \textit{0.1350} & \textit{0.5465} & \textit{0.7959} & \textit{0.7820} & \textit{0.336} & \textit{18} \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-The test PR-AUC of 0.5152 is 0.0065 below the benchmark C2 result of 0.5217,
-which uses \texttt{encoding\_dim = 10} on the same architecture. A 4-dimensional
-bottleneck compresses 18 features into too few latent dimensions. The benchmark
-confirms that 10 dimensions is better. The cross-validated training PR-AUC
-(0.5425) is higher than the test PR-AUC (0.5152), a gap of 0.0273 that suggests
-overfitting in the grid search with a smaller bottleneck.
+The best LR condition is \texttt{original} at PR-AUC~$= 0.5087$, 0.0194
+below C0. Class-weighting and SMOTE both reduce PR-AUC and sharply increase
+the Brier score: from 0.1423 (original) to 0.1960 (class-weighted) and 0.1937
+(SMOTE). This happens because class-weighting and SMOTE push the model to
+output higher probabilities for positive cases, shifting the calibration
+curve. The Brier score measures calibration quality; a jump from 0.142 to
+0.196 signals that the calibrated probabilities are further from the true
+empirical frequencies, even after isotonic calibration on the calibration
+slice.
+
+PCA reduces PR-AUC by at most 0.0056 (original 0.5087 vs.\ original\_PCA
+0.5031). Compressing 18 features to 13 principal components retaining 95\%
+of variance barely changes the logistic regression's discrimination power.
+The threshold $\tau^* = 0.319$ is identical for original and original\_PCA,
+confirming both models operate at the same operating point on the
+precision-recall curve.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.7\linewidth]{teammate1/results/pr_curves.png}
+  \caption{Precision-recall curves for the three base logistic regression
+           conditions (without PCA). The original distribution curve (blue)
+           lies above both the balanced and SMOTE curves across most recall
+           levels, consistent with its higher PR-AUC of 0.509 vs.\ 0.497
+           and 0.487.}
+  \label{fig:lr_pr}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.55\linewidth]{teammate1/results/confusion_matrix_best.png}
+  \caption{Confusion matrix for the best LR condition (original, $\tau^* =
+           0.319$, test set of 5,993 rows). Of 1,326 true defaulters, 663
+           are correctly identified (recall~$= 0.50$). Of 4,667 true
+           non-defaulters, 4,107 are correctly classified (recall~$= 0.88$
+           for the majority class).}
+  \label{fig:lr_cm}
+\end{figure}
+
+Table~\ref{tab:lr_coefs} shows the logistic regression coefficients for the
+original (no PCA, no balancing) condition. The three largest positive
+coefficients confirm the EDA finding: payment delay drives default
+prediction. The negative coefficient on \texttt{Bill\_std} ($-0.221$) is
+less intuitive but makes sense in context: customers who maintain a more
+stable outstanding balance tend to be more financially organised and default
+less. \texttt{LIMIT\_BAL} has a negative coefficient ($-0.107$) because higher
+limits are granted to lower-risk customers.
+
+\texttt{Pay\_delay\_max} appears with a negative coefficient ($-0.113$)
+despite its positive raw correlation with the target ($r = 0.331$). This
+is a collinearity effect: \texttt{Pay\_delay\_mean} ($+0.531$) already
+captures most of the delay signal. In the joint model, once
+\texttt{Pay\_delay\_mean} and \texttt{Pay\_delay\_std} are accounted for,
+\texttt{Pay\_delay\_max} carries a partial negative coefficient through
+suppression. This does not mean that high \texttt{Pay\_delay\_max} predicts
+non-default; it means the coefficient is not interpretable in isolation when
+correlated features are present.
+
+\begin{table}[H]
+\centering
+\caption{LR coefficients for the original condition (18 features, no
+         balancing). Positive values increase the log-odds of default;
+         negative values decrease them.}
+\label{tab:lr_coefs}
+\small
+\begin{tabular}{lr}
+\toprule
+Feature & Coefficient \\
+\midrule
+Pay\_delay\_mean   & $+0.531$ \\
+PAY\_0             & $+0.389$ \\
+Pay\_delay\_std    & $+0.286$ \\
+Utilization\_mean  & $+0.076$ \\
+AGE                & $+0.034$ \\
+n\_months\_over\_limit & $+0.027$ \\
+\midrule
+Bill\_std          & $-0.221$ \\
+Bill\_mean         & $-0.192$ \\
+LIMIT\_BAL         & $-0.107$ \\
+Pay\_delay\_max    & $-0.113$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{UMAP + KNN results}
+
+Table~\ref{tab:knn_results} reports all four KNN conditions.
+
+\begin{table}[H]
+\centering
+\caption{UMAP + KNN results. The optimal KNN hyperparameters are shown in the
+         $k$ column; the best condition uses Manhattan distance and uniform
+         weights. Brier scores for SMOTE conditions reflect miscalibration
+         even after isotonic correction.}
+\label{tab:knn_results}
+\small
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Condition & PR-AUC & Brier & F1@$\tau^*$ & Accuracy & ROC-AUC & $\tau^*$ & $k$ & Feat. \\
+\midrule
+original      & 0.4999 & 0.1429 & 0.5099 & 0.7681 & 0.7502 & 0.333 & 15 & 18 \\
+original\_UMAP & 0.4879 & 0.1441 & 0.5040 & 0.7914 & 0.7470 & 0.381 & 21 & 2 \\
+smote         & 0.4749 & 0.1722 & 0.0903 & 0.7849 & 0.7435 & 1.000 & 15 & 18 \\
+smote\_UMAP   & 0.4559 & 0.1977 & 0.4833 & 0.6975 & 0.7314 & 0.468 & 31 & 2 \\
+\midrule
+\textit{C0 XGB (ref.)} & \textit{0.5281} & \textit{0.1350} & \textit{0.5465} & \textit{0.7959} & \textit{0.7820} & \textit{0.336} & — & \textit{18} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The best KNN condition (\texttt{original}, $k = 15$, Manhattan distance,
+uniform weights) achieves PR-AUC~$= 0.4999$, 0.0282 below C0. UMAP to 2D
+costs 0.012 PR-AUC (original 0.4999 vs.\ original\_UMAP 0.4879). The
+smote condition produces a degenerate threshold: $\tau^* = 1.000$ and
+F1~$= 0.0903$.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\linewidth]{teammate2/results/knn_performance_comparison.png}
+  \caption{KNN performance comparison across all four conditions on PR-AUC,
+           Brier, F1, and ROC-AUC. The smote condition's degenerate F1
+           (0.09) is visible as a near-zero bar, contrasting with its
+           PR-AUC of 0.47, which remains valid because PR-AUC is
+           threshold-free.}
+  \label{fig:knn_compare}
+\end{figure}
+
+The SMOTE-trained KNN calibration collapse ($\tau^* = 1.000$) requires
+explanation. KNN trained on a balanced 50/50 dataset outputs probabilities
+near 0.5 for most test examples (because each query point's 15 nearest
+neighbours in the balanced training set contain roughly equal numbers of
+defaulters and non-defaulters). When this model is evaluated on the
+natural 78/22 calibration set, isotonic regression calibrates the
+probabilities, but the output distribution is clustered near 0.5 with
+little variation. The F1-optimal threshold on this flat distribution is
+forced to 1.0 (classifying everything as non-default achieves the highest
+F1, because the positives are too sparse to push above 50\% in any local
+neighbourhood). The rank-based PR-AUC of 0.4749 remains valid because
+it does not depend on a fixed threshold.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/umap_original_train_class.png}
+    \caption{Coloured by default class (blue = non-default, orange = default).}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/umap_original_train_pay_delay.png}
+    \caption{Coloured by \texttt{Pay\_delay\_mean} (darker = longer delay).}
+  \end{subfigure}
+  \caption{2D UMAP projection of the original training set (23,972 rows).
+           The two classes are not cleanly separated in 2D; defaulters
+           (orange) and non-defaulters (blue) overlap substantially,
+           explaining why UMAP compression reduces PR-AUC.}
+  \label{fig:umap_class}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/umap_original_train_risk_score.png}
+    \caption{Coloured by \texttt{Risk\_score} (darker = higher risk).}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/umap_comparison_original_vs_balanced.png}
+    \caption{Original (left) vs.\ SMOTE-balanced (right) training sets.}
+  \end{subfigure}
+  \caption{Risk score overlaid on the UMAP embedding (left) and comparison of
+           the original vs.\ balanced training distribution (right). Higher
+           Risk\_score values cluster toward the defaulter-dense regions,
+           confirming the feature's 0.239 Pearson correlation with the target.
+           The balanced embedding shows synthetic SMOTE points filling the
+           minority-class regions uniformly.}
+  \label{fig:umap_compare}
+\end{figure}
+
+Figure~\ref{fig:umap_class}(a) shows the core challenge: even in 2D, the
+default and non-default groups overlap heavily. KNN with $k = 15$ must
+classify points in this overlap region by plurality vote, which produces
+systematic errors where the two classes intermingle. Compressing to 2D
+discards 16 dimensions that contain genuine discriminative information,
+which is why original\_UMAP (PR-AUC~$= 0.4879$) falls below original
+(PR-AUC~$= 0.4999$).
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/confusion_matrix_original.png}
+    \caption{original ($k=15$, Manhattan, $\tau^*=0.333$)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate2/results/confusion_matrix_original_UMAP.png}
+    \caption{original\_UMAP ($k=21$, $\tau^*=0.381$)}
+  \end{subfigure}
+  \caption{Confusion matrices for the two KNN conditions without SMOTE (test
+           set, 5,993 rows). The UMAP condition correctly identifies more
+           non-defaulters (specificity improves from 0.768 to 0.791) but
+           misses more defaulters (recall drops from 0.51 to 0.50).}
+  \label{fig:knn_cm}
+\end{figure}
+
+\subsection{SVM + LDA results}
+
+Table~\ref{tab:svm_results} reports all four SVM conditions.
+
+\begin{table}[H]
+\centering
+\caption{SVM + LDA results. Fit time in seconds reflects the quadratic scaling
+         of the RBF-SVM kernel matrix with the number of training examples;
+         the balanced condition (37,336 rows) takes $215$~s vs.\ $38$~s for
+         the original ($21,575$ rows), a factor of~5.7.}
+\label{tab:svm_results}
+\small
+\begin{tabular}{lrrrrrrrl}
+\toprule
+Condition & PR-AUC & Brier & F1@$\tau^*$ & Accuracy & ROC-AUC & $\tau^*$ & Feat. & Fit(s) \\
+\midrule
+original        & 0.5144 & 0.1418 & 0.5129 & 0.7579 & 0.7127 & 0.152 & 18 & 38 \\
+balanced        & 0.4730 & 0.1718 & 0.4990 & 0.7983 & 0.7408 & 0.709 & 18 & 215 \\
+original\_LDA   & 0.4671 & 0.1468 & 0.5231 & 0.7886 & 0.6874 & 0.148 & 1  & 93 \\
+balanced\_LDA   & 0.3967 & 0.1969 & 0.4935 & 0.7579 & 0.7070 & 0.656 & 1  & 206 \\
+\midrule
+\textit{C0 XGB (ref.)} & \textit{0.5281} & \textit{0.1350} & \textit{0.5465} & \textit{0.7959} & \textit{0.7820} & \textit{0.336} & \textit{18} & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SVM original (PR-AUC~$= 0.5144$) is the strongest single-teammate model,
+beating LR original (0.5087) and KNN original (0.4999). LDA reduces this by
+0.0473 (original 0.5144 vs.\ original\_LDA 0.4671). Balanced SVM (SMOTE,
+0.4730) is 0.0414 below original. Balanced\_LDA (0.3967) is the weakest
+condition across all four model families in this study.
+
+\paragraph{Low threshold in SVM original.}
+The threshold $\tau^* = 0.152$ for SVM original is the lowest among all
+unbalanced conditions. SVM with Platt scaling often produces probability
+outputs concentrated in a narrow band, and the F1-optimal threshold on the
+calibration set for a 22\%-positive problem can be well below 0.5. At
+$\tau^* = 0.152$, the model flags a larger fraction of the test set as
+default, achieving recall of 0.58 at the cost of precision of 0.46 (see
+confusion matrix Figure~\ref{fig:svm_cm}). The ROC-AUC of 0.7127 is notably
+lower than LR (0.7458) and KNN (0.7502) despite a higher PR-AUC (0.5144).
+This divergence means the SVM ranks the top-probability positives well
+(high precision at low recall) but degrades faster in the tail than LR or
+KNN. For PR-AUC, which weights all threshold levels, the SVM still wins; for
+ROC-AUC, which also weights the full negative spectrum, LR and KNN win.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/confusion_matrix_original.png}
+    \caption{SVM original ($\tau^*=0.152$)}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/confusion_matrix_original_LDA.png}
+    \caption{SVM original\_LDA ($\tau^*=0.148$)}
+  \end{subfigure}
+  \caption{Confusion matrices for SVM without balancing (test set, 5,993 rows).
+           The original (18-feature) SVM correctly identifies 769 of 1,326 true
+           defaulters (recall~$= 0.58$). After LDA compression to 1D, the
+           same recall drops to 0.52 on 690 correct detections.}
+  \label{fig:svm_cm}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/lda_distribution_original_LDA.png}
+    \caption{LDA projection, original training set.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/lda_distribution_balanced_LDA.png}
+    \caption{LDA projection, SMOTE-balanced training set.}
+  \end{subfigure}
+  \caption{Kernel density estimates of the 1D LDA projections by class.
+           In both cases, the two class distributions substantially overlap,
+           explaining why a single discriminant direction cannot separate
+           defaulters from non-defaulters cleanly. The balanced condition
+           (right) shifts the minority-class distribution upward because
+           SMOTE generates synthetic samples in regions where defaulters
+           already concentrate.}
+  \label{fig:lda_dist}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/roc_curve_original_LDA.png}
+    \caption{ROC curve, original\_LDA.}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.48\linewidth}
+    \includegraphics[width=\linewidth]{teammate3/results/roc_curve_balanced_LDA.png}
+    \caption{ROC curve, balanced\_LDA.}
+  \end{subfigure}
+  \caption{ROC curves for the two LDA conditions. The original\_LDA ROC-AUC
+           of 0.687 and balanced\_LDA's 0.707 both fall below the
+           corresponding no-LDA conditions (0.713 and 0.741), confirming
+           that LDA projection discards discriminative information.}
+  \label{fig:svm_roc}
+\end{figure}
+
+Figure~\ref{fig:lda_dist} shows why LDA performs poorly on this problem:
+collapsing 18 features to a single linear direction produces heavily
+overlapping class distributions. LDA finds the direction that maximises
+between-class variance relative to within-class variance, but that direction
+is a weighted sum of all 18 features. The RBF-SVM can exploit non-linear
+interactions among all 18 features in the original space; on a single scalar,
+only a linear threshold separates the classes. The PR-AUC penalty of
+0.047 (original 0.5144 vs.\ original\_LDA 0.4671) measures this information
+loss directly.
+
+%─────────────────────────────────────────────────────────────────────────────
+\section{Cross-Model Comparison and Analysis}
+%─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Ranking by PR-AUC}
+
+Table~\ref{tab:cross_model} compares the best condition from each model
+family, using PR-AUC as the primary ranking criterion.
+
+\begin{table}[H]
+\centering
+\caption{Best condition per model family, ranked by PR-AUC. The naive
+         all-negative baseline achieves PR-AUC~$\approx 0.221$ (the positive
+         base rate), Brier~$= 0.172$, and F1~$= 0$.}
+\label{tab:cross_model}
+\small
+\begin{tabular}{llrrrr}
+\toprule
+Model & Best condition & PR-AUC & Brier & F1@$\tau^*$ & ROC-AUC \\
+\midrule
+XGB-only (C0)     & $w = 3.52$, 18 features & \textbf{0.5281} & 0.1350 & 0.5465 & 0.7820 \\
+AE + XGB (C2)     & Weighted AE + PAY\_0 concat & 0.5217 & 0.1362 & 0.5398 & 0.7772 \\
+SVM rbf           & Original, 18 features & 0.5144 & 0.1418 & 0.5129 & 0.7127 \\
+Logistic Regression & Original, 18 features & 0.5087 & 0.1423 & 0.5183 & 0.7458 \\
+KNN               & Original, 18 features, $k=15$ & 0.4999 & 0.1429 & 0.5099 & 0.7502 \\
+\midrule
+Naive baseline    & Always predict no-default & 0.221 & 0.172 & 0.000 & 0.500 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+XGB-only on raw features is the top performer. All four non-XGB models
+fall below 0.529. The ranking XGB $>$ SVM $>$ LR $>$ KNN holds across the
+best conditions of each family. The gap from XGB (0.528) to KNN (0.500)
+is 0.028 PR-AUC; the gap from KNN to the naive baseline (0.221) is 0.279.
+All four models are well above the baseline.
+
+\subsection{Effect of oversampling on calibration quality}
+
+Across all four model families, SMOTE consistently raises the Brier score
+(worsens calibration) and reduces PR-AUC:
+
+\begin{itemize}
+  \item \textbf{LR}: original Brier~$= 0.1423$, smote Brier~$= 0.1937$ ($+0.051$).
+        PR-AUC drops from 0.5087 to 0.4870 ($-0.022$).
+  \item \textbf{KNN}: original Brier~$= 0.1429$, smote Brier~$= 0.1722$ ($+0.029$).
+        PR-AUC drops from 0.4999 to 0.4749 ($-0.025$). The smote\_UMAP condition
+        reaches Brier~$= 0.1977$ ($+0.054$).
+  \item \textbf{SVM}: original Brier~$= 0.1418$, balanced Brier~$= 0.1718$ ($+0.030$).
+        PR-AUC drops from 0.5144 to 0.4730 ($-0.041$).
+  \item \textbf{AE + XGB}: SMOTE on latents (C5) Brier~$= 0.1372$ vs.\ C4 (no SMOTE)
+        Brier~$= 0.1382$; the effect is smaller because SMOTE here is applied
+        in 10-dimensional latent space rather than the original feature space.
+\end{itemize}
+
+The mechanism is the same across all families. Training on a balanced 50/50
+dataset trains the model to output probabilities near 0.5 on balanced data.
+When the model is evaluated on the natural 22\%-positive test distribution,
+probabilities are skewed too high for the positive class: the model has
+learned that positives occur half the time, but on the test set they occur
+only 22\% of the time. Isotonic regression calibration on the calibration
+slice corrects some of this, but the isotonic fitter has only 2,397
+calibration points and cannot fully correct a large distributional mismatch.
+The Brier score increase is the residual of this miscalibration after the
+isotonic correction.
+
+\subsection{Effect of dimensionality reduction}
+
+Three dimensionality reduction methods are tested, with very different outcomes:
+
+\begin{itemize}
+  \item \textbf{PCA (95\% variance, 18D to 13D, LR)}: PR-AUC loss of 0.006
+        (0.5087 to 0.5031). PCA retains 95\% of variance by construction,
+        so minimal discriminative information is discarded. For a linear model
+        like logistic regression, PCA-orthogonalised features and original
+        correlated features carry exactly the same linear information. The
+        0.006 drop may reflect the 5\% variance discarded or minor numerical
+        differences in the optimisation path.
+
+  \item \textbf{UMAP (18D to 2D, KNN)}: PR-AUC loss of 0.012 (0.4999 to
+        0.4879). Compressing to 2 dimensions discards more than PCA, and
+        the neighbourhood-preserving objective of UMAP does not guarantee that
+        discriminative structure is preserved in 2D when classes overlap in
+        higher dimensions. As Figure~\ref{fig:umap_class}(a) shows, the 2D
+        embedding has heavy class overlap, which a KNN classifier cannot resolve.
+
+  \item \textbf{LDA (18D to 1D, SVM)}: PR-AUC loss of 0.047 (0.5144 to
+        0.4671). Projecting 18 features to a single scalar is the most
+        aggressive compression in this study. LDA finds the optimal linear
+        separator in 1D, but as Figure~\ref{fig:lda_dist} shows, the
+        resulting class distributions heavily overlap even on that optimal
+        direction. The RBF-SVM can exploit non-linear interactions in 18D;
+        on a 1D scalar it reduces to a threshold classifier.
+\end{itemize}
+
+The pattern is: larger dimensionality reduction causes larger PR-AUC loss.
+PCA loses 33\% of the features and 0.006 PR-AUC; UMAP loses 89\% and
+0.012 PR-AUC; LDA loses 94\% and 0.047 PR-AUC. Dimensionality reduction
+is not free.
+
+\subsection{ROC-AUC vs.\ PR-AUC divergence}
+
+The SVM presents the clearest example of ROC-AUC and PR-AUC diverging.
+SVM original achieves PR-AUC~$= 0.5144$ but ROC-AUC~$= 0.7127$, lower than
+both KNN original (ROC-AUC~$= 0.7502$) and LR original (ROC-AUC~$= 0.7458$).
+
+This divergence means the SVM ranks the highest-confidence positives well
+(the top of its score distribution contains a dense cluster of true defaulters)
+but its score distribution for the rest of the positive class interleaves with
+the negative class more than LR or KNN does. PR-AUC weights precision at
+every recall level equally, so a model that is very precise at low recall
+(top of the ranked list) scores well even if it degrades at higher recall.
+ROC-AUC weights true positive rate vs.\ false positive rate at every threshold,
+treating all threshold levels symmetrically, so the SVM's weaker performance
+at the tail of its distribution costs ROC-AUC more than it costs PR-AUC.
+
+At a 22\% positive rate, PR-AUC is the more meaningful metric for the
+deployment scenario of flagging a manageable subset of accounts for review.
+A credit risk team will review the top-$k$ flagged accounts rather than
+all accounts above a fixed threshold; for that use case, high precision at
+low recall is what matters, and PR-AUC measures it.
+
+\subsection{Threshold behaviour across models}
+
+Table~\ref{tab:thresholds} summarises $\tau^*$ for all best conditions.
+
+\begin{table}[H]
+\centering
+\caption{Optimal thresholds for the best condition of each model family and
+         for notable degenerate cases. All thresholds are tuned on the same
+         calibration slice.}
+\label{tab:thresholds}
+\small
+\begin{tabular}{llr}
+\toprule
+Model & Condition & $\tau^*$ \\
+\midrule
+XGB-only & C0 ($w=3.52$) & 0.336 \\
+AE + XGB & C2 (weighted + PAY\_0) & 0.280 \\
+Logistic Regression & original & 0.319 \\
+KNN & original & 0.333 \\
+SVM & original & 0.152 \\
+\midrule
+LR & balanced\_cw & 0.577 \\
+SVM & balanced & 0.709 \\
+KNN & smote (degenerate) & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Unbalanced conditions cluster between 0.152 and 0.336. The SVM's low
+threshold (0.152) reflects that Platt scaling on an RBF-SVM produces a
+probability distribution concentrated near 0.5; the calibration slice pushes
+$\tau^*$ low to recover enough true positives. All AE conditions cluster
+near 0.28--0.32 because the autoencoder pipeline produces probability outputs
+at a different scale than XGB-only before calibration, and isotonic correction
+maps them to a range where the F1-optimal cut lands lower.
+
+Balanced conditions (class-weighted or SMOTE) have $\tau^* > 0.5$. This is
+the calibration miscalibration problem from the previous section visible
+in $\tau^*$: the model is outputting inflated probabilities for positives,
+so isotonic calibration maps the raw probabilities downward, but the
+F1-optimal cut still needs to be pushed above 0.5 to avoid flagging too
+much of the test set. The KNN smote's $\tau^* = 1.000$ is the extreme case
+of this collapse, as discussed in Section~\ref{sec:results}.
 
 %─────────────────────────────────────────────────────────────────────────────
 \section{Limitations}
 %─────────────────────────────────────────────────────────────────────────────
 
-\paragraph{Three seeds are not enough to rank close conditions.}
-Standard deviation estimates from three samples carry roughly 50\% relative
-error. Four of the seven conditions lie within one standard deviation of the
-top PR-AUC. No reliable ranking among those four is possible from this data.
-Five or more seeds would be needed to confidently separate them.
+\paragraph{Three seeds are insufficient to rank close conditions.}
+Standard deviation estimates from three samples carry approximately 50\%
+relative error. Four of the seven AE+XGB conditions lie within one standard
+deviation of the top PR-AUC. No reliable ordering is possible among C0, C1,
+C2, and C3 from this data alone. Seven or more seeds would be needed.
 
 \paragraph{The autoencoder is over-parameterised for this dataset.}
-A 2-neuron bottleneck achieves near-identical AUC to a 10-neuron one. The
-effective dimensionality of the data is low, consistent with the strong
-multicollinearity in the monetary features. Using a deep autoencoder as a
-feature extractor on data where PCA-equivalent linear projection captures
-nearly all structure is adding architectural complexity without a corresponding
-benefit.
+A 2-neuron bottleneck achieves near-identical AUC to the 10-neuron one.
+The effective intrinsic dimensionality of the data is well below 10, consistent
+with the high multicollinearity in the bill-amount features. An autoencoder
+added to a problem where the data lies near a low-dimensional linear subspace
+performs PCA-equivalent compression without the non-linear benefit that
+motivates using it.
 
-\paragraph{The model family is fixed.}
-XGBoost on raw features (C0) outperforms every AE+XGB variant. We cannot
-act on this finding because the project constrains the classifier family. The
-finding is real and is presented transparently.
+\paragraph{SVM and LR used fixed hyperparameters.}
+Only KNN was grid-searched. The SVM was run with $C = 1$ and default
+\texttt{gamma='scale'} without exploring other values. Logistic regression
+used the default \texttt{C = 1}. The XGB-only conditions were grid-searched
+across 16 cells with 5-fold CV. This asymmetry means the SVM and LR results
+may understate their best achievable performance, while XGB results are
+closer to their optimum.
+
+\paragraph{SMOTE applied in full feature space for LR, KNN, and SVM.}
+The preprocessed features include one-hot dummies; plain SMOTE would produce
+fractional binary values. SMOTENC is used instead and correctly preserves
+integer dummy values. However, SMOTENC synthetic samples are generated from
+all 18 features jointly, which may not respect the correlational structure
+of the original data as well as a method that treats continuous and binary
+features separately throughout oversampling.
 
 \paragraph{Temporal data is treated as cross-sectional.}
-Each row represents one customer's 6-month history. We do not model the time
-series structure within or between rows. The dataset is a snapshot (April--September
-2005) with a single binary outcome; extending the model to a rolling-window setup
-would require a different experimental design.
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Recommendations}
-%─────────────────────────────────────────────────────────────────────────────
-
-\textbf{Revert \texttt{encoding\_dim} to 10 in the Kaggle notebook.}
-The notebook was left at \texttt{encoding\_dim = 4} after an earlier
-experiment. The benchmark shows dim = 10 achieves PR-AUC = 0.5217 vs.\ 0.5152
-for dim = 4 on the same AE+XGB configuration. This is a one-line fix.
-
-\textbf{Keep PAY\_0 concatenation (C.3).}
-The ablation shows removing it drops PR-AUC by 0.0094. It is the most impactful
-design choice in the AE+XGB pipeline.
-
-\textbf{Keep isotonic calibration and threshold tuning.}
-The calibrated threshold $\tau^*$ lands consistently near 0.30, not 0.5. Using
-the default threshold would mismatch the model's probability scale and reduce
-$F1@\tau^*$ by operating at the wrong point on the precision-recall curve.
-
-\textbf{Do not use Borderline-SMOTE on latents.}
-C6 is the worst overall condition, 0.035 PR-AUC below C0. Plain SMOTE (C5) is
-neutral and adds 13 seconds of training time; it is not worth the complexity.
-
-\textbf{If the model constraint were lifted,} XGB-only on the 18 standardised
-features (C0) is the highest-performing setup in the benchmark. This should be
-reported as the unconstrained recommendation.
-
-\textbf{A one-class autoencoder approach (queued, not yet benchmarked)} trains
-the AE exclusively on non-defaulters and uses per-sample reconstruction error as
-an anomaly score feature. This is the theoretically correct use of an AE for
-imbalanced classification and would be the next thing to test.
+Each row is one customer's 6-month history condensed to summary statistics.
+No sequential structure is modelled within or across customers. The dataset
+covers a single calendar period (April--September 2005 history, October 2005
+target) and cannot be used to study concept drift or seasonal effects.
 
 %─────────────────────────────────────────────────────────────────────────────
 \section{Conclusion}
 %─────────────────────────────────────────────────────────────────────────────
 
-This project applies a Keras autoencoder and XGBoost pipeline to the UCI Taiwan
-credit card default dataset, with a fixed model architecture constraint. The
-preprocessing pipeline removes 35 duplicate rows, recodes undocumented category
-codes in EDUCATION and MARRIAGE, engineers temporal summaries from six months of
-payment data, and applies a signed log-plus-one transform to six heavy-tailed
-monetary columns, bringing the maximum standardised z-score from 72.9 to
-approximately 5--8.
+Four model families were applied to the same 29,965-row preprocessing
+output, train/test split, and evaluation protocol. The results are concrete:
+XGBoost on 18 raw features (PR-AUC~$= 0.5281$) outperforms every other
+configuration tested. The AE+XGB pipeline (PR-AUC~$= 0.5217$) is second,
+followed by SVM (0.5144), logistic regression (0.5087), and KNN (0.4999).
 
-The ablation benchmark (7 conditions, 3 seeds, 21 total runs) produces three
-concrete findings. First, XGB-only on raw features outperforms every AE+XGB
-variant by approximately 0.006 PR-AUC; the autoencoder is not contributing
-positively, likely because the data's effective dimensionality is lower than
-the bottleneck size. Second, concatenating raw \texttt{PAY\_0} with the latents
-(C.3) is the most impactful single design choice within the AE+XGB family;
-removing it costs 0.0094 PR-AUC. Third, Borderline-SMOTE on latents harms
-performance, reducing PR-AUC by 0.035 relative to XGB-only.
+Three findings hold across all four model families. First, the original
+class distribution (no SMOTE) consistently outperforms oversampled variants
+on both PR-AUC and Brier score. SMOTE raises the Brier score by 0.030--0.054
+depending on the model and degrades PR-AUC by 0.022--0.041. Second,
+dimensionality reduction always reduces PR-AUC; the magnitude of the drop
+scales with the aggressiveness of the compression: 0.006 for PCA (95\%
+variance retained, 18D to 13D), 0.012 for UMAP (18D to 2D), and 0.047 for
+LDA (18D to 1D). Third, the payment delay features
+(\texttt{Pay\_delay\_mean}, \texttt{Pay\_delay\_max}, \texttt{PAY\_0})
+are the dominant predictors across all models; AGE and the education dummies
+contribute negligibly.
 
-The primary metric (PR-AUC 0.52--0.53 for the top conditions) shows modest
-improvement over a naive majority-class baseline (PR-AUC $\approx 0.22$) and
-meaningful improvement over random ranking (PR-AUC = 0.22), but clear room
-remains for stronger feature engineering or, if the constraint were lifted, a
-different model family.
+Within the constrained AE+XGB pipeline, the ablation identifies one design
+choice that matters: concatenating raw \texttt{PAY\_0} with the latent
+vector costs 0.0094 PR-AUC if removed. Weighted AE loss and
+\texttt{scale\_pos\_weight} corrections are both neutral within measurement
+noise. Borderline-SMOTE on latents is harmful (PR-AUC~$= 0.4933$, the worst
+single condition in the study). If the model constraint were lifted, dropping
+the autoencoder and running XGBoost directly on the 18 standardised features
+with a 16-cell grid search is the best-supported recommendation from
+this benchmark.
 
 \end{document}
