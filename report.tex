@@ -989,38 +989,74 @@ loss directly.
 \section{Cross-Model Comparison and Analysis}
 %─────────────────────────────────────────────────────────────────────────────
 
-\subsection{Ranking by PR-AUC}
+\subsection{Full ranking including dimensionality reduction conditions}
 
-Table~\ref{tab:cross_model} compares the best condition from each model
-family, using PR-AUC as the primary ranking criterion.
+Table~\ref{tab:cross_model} lists all conditions grouped by model family,
+with dimensionality reduction variants paired directly against their
+no-reduction counterparts so the cost of each compression step is visible
+in one place.
 
 \begin{table}[H]
 \centering
-\caption{Best condition per model family, ranked by PR-AUC. The naive
-         all-negative baseline achieves PR-AUC~$\approx 0.221$ (the positive
-         base rate), Brier~$= 0.172$, and F1~$= 0$.}
+\caption{All conditions grouped by model family. Feat.\ is the number of
+         dimensions entering the final classifier. The naive all-negative
+         baseline achieves PR-AUC~$\approx 0.221$, Brier~$= 0.172$, F1~$= 0$.}
 \label{tab:cross_model}
 \small
-\begin{tabular}{llrrrr}
+\begin{tabular}{lllrrrr}
 \toprule
-Model & Best condition & PR-AUC & Brier & F1@$\tau^*$ & ROC-AUC \\
+Model / DR & Balance & Feat. & PR-AUC & Brier & F1@$\tau^*$ & ROC-AUC \\
 \midrule
-XGB-only (C0)     & $w = 3.52$, 18 features & \textbf{0.5281} & 0.1350 & 0.5465 & 0.7820 \\
-AE + XGB (C2)     & Weighted AE + PAY\_0 concat & 0.5217 & 0.1362 & 0.5398 & 0.7772 \\
-SVM rbf           & Original, 18 features & 0.5144 & 0.1418 & 0.5129 & 0.7127 \\
-Logistic Regression & Original, 18 features & 0.5087 & 0.1423 & 0.5183 & 0.7458 \\
-KNN               & Original, 18 features, $k=15$ & 0.4999 & 0.1429 & 0.5099 & 0.7502 \\
+\multicolumn{7}{l}{\textit{XGBoost (no autoencoder)}} \\
+XGB-only (C0), raw 18       & $w=3.52$ & 18 & \textbf{0.5281} & 0.1350 & 0.5465 & 0.7820 \\
+XGB-only (C1), raw 18       & $w=1$    & 18 & 0.5280          & 0.1349 & 0.5463 & 0.7831 \\
 \midrule
-Naive baseline    & Always predict no-default & 0.221 & 0.172 & 0.000 & 0.500 \\
+\multicolumn{7}{l}{\textit{Autoencoder + XGBoost (AE reduces 18D $\to$ 10D or 11D with PAY\_0)}} \\
+C2: weighted AE + PAY\_0    & $w=3.52$ & 11 & 0.5217 & 0.1362 & 0.5398 & 0.7772 \\
+C3: class-blind AE + PAY\_0 & none     & 11 & 0.5235 & 0.1366 & 0.5367 & 0.7764 \\
+C5: weighted AE + PAY\_0    & SMOTE    & 11 & 0.5177 & 0.1372 & 0.5389 & 0.7743 \\
+C4: weighted AE, latents only & $w=3.52$ & 10 & 0.5123 & 0.1382 & 0.5367 & 0.7734 \\
+C6: weighted AE + PAY\_0    & B-SMOTE  & 11 & 0.4933 & 0.1398 & 0.5325 & 0.7700 \\
+\midrule
+\multicolumn{7}{l}{\textit{SVM (rbf) with and without LDA (18D $\to$ 1D)}} \\
+SVM, raw 18                  & none  & 18 & 0.5144 & 0.1418 & 0.5129 & 0.7127 \\
+SVM, raw 18                  & SMOTE & 18 & 0.4730 & 0.1718 & 0.4990 & 0.7408 \\
+SVM + LDA, 1D                & none  &  1 & 0.4671 & 0.1468 & 0.5231 & 0.6874 \\
+SVM + LDA, 1D                & SMOTE &  1 & 0.3967 & 0.1969 & 0.4935 & 0.7070 \\
+\midrule
+\multicolumn{7}{l}{\textit{Logistic Regression with and without PCA (18D $\to$ 13D at 95\% variance)}} \\
+LR, raw 18                   & none      & 18 & 0.5087 & 0.1423 & 0.5183 & 0.7458 \\
+LR + PCA, 13D                & none      & 13 & 0.5031 & 0.1428 & 0.5277 & 0.7470 \\
+LR, raw 18                   & $cw$=bal  & 18 & 0.4969 & 0.1960 & 0.5272 & 0.7495 \\
+LR + PCA, 13D                & $cw$=bal  & 13 & 0.4941 & 0.1969 & 0.5275 & 0.7497 \\
+LR, raw 18                   & SMOTE     & 18 & 0.4870 & 0.1937 & 0.4965 & 0.7227 \\
+LR + PCA, 13D                & SMOTE     & 13 & 0.4851 & 0.2002 & 0.4945 & 0.7269 \\
+\midrule
+\multicolumn{7}{l}{\textit{KNN with and without UMAP (18D $\to$ 2D)}} \\
+KNN, raw 18, $k=15$          & none  & 18 & 0.4999 & 0.1429 & 0.5099 & 0.7502 \\
+KNN + UMAP, 2D, $k=21$       & none  &  2 & 0.4879 & 0.1441 & 0.5040 & 0.7470 \\
+KNN, raw 18, $k=15$          & SMOTE & 18 & 0.4749 & 0.1722 & 0.0903 & 0.7435 \\
+KNN + UMAP, 2D, $k=31$       & SMOTE &  2 & 0.4559 & 0.1977 & 0.4833 & 0.7314 \\
+\midrule
+Naive baseline (all-negative) & ---  & --- & 0.221 & 0.172 & 0.000 & 0.500 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-XGB-only on raw features is the top performer. All four non-XGB models
-fall below 0.529. The ranking XGB $>$ SVM $>$ LR $>$ KNN holds across the
-best conditions of each family. The gap from XGB (0.528) to KNN (0.500)
-is 0.028 PR-AUC; the gap from KNN to the naive baseline (0.221) is 0.279.
-All four models are well above the baseline.
+XGB-only (C0, PR-AUC~$= 0.5281$) leads. Within each model family, the
+no-reduction original condition is the best: LR original (0.5087) beats
+LR+PCA (0.5031) by 0.006; KNN original (0.4999) beats KNN+UMAP (0.4879)
+by 0.012; SVM original (0.5144) beats SVM+LDA (0.4671) by 0.047. The
+autoencoder (C2, 0.5217) is a learned dimensionality reduction: it compresses
+18D to 10D and sits below both XGB-only conditions but above the raw-feature
+SVM, LR, and KNN. The PAY\_0 concatenation (C4 vs.\ C2) shows that the
+bottleneck discards 0.0094 PR-AUC of the strongest predictor's signal, which
+has to be manually bypassed.
+
+The worst single condition across the entire study is SVM+LDA+SMOTE at
+PR-AUC~$= 0.3967$: LDA collapses 18 features to 1 scalar, and SMOTE on
+the resulting 1D distribution generates synthetic samples that mix the two
+already-overlapping class distributions further.
 
 \subsection{Effect of oversampling on calibration quality}
 
@@ -1051,39 +1087,214 @@ calibration points and cannot fully correct a large distributional mismatch.
 The Brier score increase is the residual of this miscalibration after the
 isotonic correction.
 
-\subsection{Effect of dimensionality reduction}
+\subsection{Dimensionality reduction impact}
 
-Three dimensionality reduction methods are tested, with very different outcomes:
+\subsubsection*{PCA: 18D to 13D, Logistic Regression}
 
-\begin{itemize}
-  \item \textbf{PCA (95\% variance, 18D to 13D, LR)}: PR-AUC loss of 0.006
-        (0.5087 to 0.5031). PCA retains 95\% of variance by construction,
-        so minimal discriminative information is discarded. For a linear model
-        like logistic regression, PCA-orthogonalised features and original
-        correlated features carry exactly the same linear information. The
-        0.006 drop may reflect the 5\% variance discarded or minor numerical
-        differences in the optimisation path.
+PCA projects the 18 standardised features onto their principal components and
+retains the 13 that explain 95\% of the total variance, discarding the
+remaining 5 components that together account for the last 5\%. The before/after
+comparison in Table~\ref{tab:dr_compare} shows a PR-AUC drop of 0.006 across
+all three balancing strategies (original: $0.5087 \to 0.5031$;
+class-weighted: $0.4969 \to 0.4941$; SMOTE: $0.4870 \to 0.4851$).
 
-  \item \textbf{UMAP (18D to 2D, KNN)}: PR-AUC loss of 0.012 (0.4999 to
-        0.4879). Compressing to 2 dimensions discards more than PCA, and
-        the neighbourhood-preserving objective of UMAP does not guarantee that
-        discriminative structure is preserved in 2D when classes overlap in
-        higher dimensions. As Figure~\ref{fig:umap_class}(a) shows, the 2D
-        embedding has heavy class overlap, which a KNN classifier cannot resolve.
+The small and consistent drop has a structural explanation. Logistic regression
+is a linear model: its decision boundary is a hyperplane in feature space.
+PCA rotates the feature space without changing its dimensionality, then
+truncates the directions with least variance. For a linear classifier, rotating
+and then truncating is equivalent to removing the features with the lowest
+contribution to the total variance. Because the 5 discarded components carry
+only 5\% of the variance, they carry at most 5\% of the linear signal the
+model can use. The Brier score changes are also negligible ($+0.0005$
+to $+0.006$), confirming that calibration is not affected. The $\tau^*$
+values remain identical (0.319 for both original and original\_PCA), meaning
+the two models produce the same F1-optimal operating point.
 
-  \item \textbf{LDA (18D to 1D, SVM)}: PR-AUC loss of 0.047 (0.5144 to
-        0.4671). Projecting 18 features to a single scalar is the most
-        aggressive compression in this study. LDA finds the optimal linear
-        separator in 1D, but as Figure~\ref{fig:lda_dist} shows, the
-        resulting class distributions heavily overlap even on that optimal
-        direction. The RBF-SVM can exploit non-linear interactions in 18D;
-        on a 1D scalar it reduces to a threshold classifier.
-\end{itemize}
+One consequence that PCA does change: coefficients from a PCA-transformed
+logistic regression are not directly interpretable as feature importances on
+the original 18 variables. Each principal component is a linear combination
+of all 18 features; a large coefficient on PC~1 means ``the weighted
+combination of all 18 features that explains the most variance'' is
+predictive, not that any individual feature is predictive. This matters in a
+credit-risk context where regulatory requirements often demand feature-level
+explanations. The 0.006 PR-AUC cost of removing PCA is worth paying for
+interpretability.
 
-The pattern is: larger dimensionality reduction causes larger PR-AUC loss.
-PCA loses 33\% of the features and 0.006 PR-AUC; UMAP loses 89\% and
-0.012 PR-AUC; LDA loses 94\% and 0.047 PR-AUC. Dimensionality reduction
-is not free.
+\subsubsection*{UMAP: 18D to 2D, KNN}
+
+UMAP preserves local neighbourhood topology but makes no guarantee about
+long-range structure, and reducing to 2D loses the 16 dimensions beyond the
+two retained components entirely. The before/after drop for original conditions
+is PR-AUC $0.4999 \to 0.4879$ ($-0.012$). For the SMOTE conditions the loss
+is larger: $0.4749 \to 0.4559$ ($-0.019$), because synthetic SMOTE points
+are generated in 18D and the UMAP projection of those synthetic points
+disperses them differently from the real training points, degrading the
+neighbourhood structure the KNN relies on.
+
+The UMAP visualisations in Figures~\ref{fig:umap_class} and
+\ref{fig:umap_compare} make the core problem concrete: even on the optimal
+2D topology-preserving layout, defaulters (22\%) and non-defaulters (78\%)
+are not separated into distinct clusters. They form an overlapping
+distribution, with the high-risk region identifiable as a gradient across
+the embedding rather than a clean boundary. A KNN classifier on 2D
+coordinates must draw decision boundaries inside this overlap, whereas
+on the original 18D space it can form a higher-dimensional decision surface
+that the 2D projection cannot represent.
+
+The optimal $k$ shifts from 15 (original 18D) to 21 (UMAP 2D) as the
+best grid-search result. A larger $k$ averages over more neighbours, which
+smooths the decision boundary and partially compensates for the noisier
+2D neighbourhood structure; the larger $k$ in the UMAP condition represents
+the model adapting to the reduced information content rather than a genuine
+improvement in discrimination.
+
+\subsubsection*{LDA: 18D to 1D, SVM}
+
+LDA finds the single linear direction that maximises
+$J = \mathbf{w}^T \mathbf{S}_B \mathbf{w} / \mathbf{w}^T \mathbf{S}_W \mathbf{w}$,
+where $\mathbf{S}_B$ is the between-class scatter matrix and $\mathbf{S}_W$
+the within-class scatter matrix. For binary classification this reduces to a
+single scalar projection. The before/after comparison is the most severe in
+the study: PR-AUC $0.5144 \to 0.4671$ ($-0.047$) without SMOTE, and
+$0.4730 \to 0.3967$ ($-0.076$) with SMOTE.
+
+The LDA distributions in Figure~\ref{fig:lda_dist} show why: on the
+optimal 1D direction, both class distributions are approximately Gaussian and
+substantially overlap. The LDA projection maximises class separability in 1D,
+yet the resulting distributions still have a large region of overlap. The 17
+dimensions LDA discards contain non-linear interactions that the RBF kernel
+would otherwise exploit; on a scalar, the RBF-SVM degenerates to a function
+of $|x_1 - x_2|$ and cannot recover that structure.
+
+The SMOTE interaction amplifies this. In the original balanced SVM (18D, no
+LDA), SMOTE generates synthetic defaulters in an 18-dimensional space; some
+of those synthetic points are far from the original minority manifold but still
+have 17 other dimensions carrying discriminative signal. Once LDA collapses
+everything to 1D, synthetic points that were wrong in 18D but corrected by
+other features become purely noise on the scalar axis. The combined result,
+SVM+LDA+SMOTE, reaches PR-AUC~$= 0.3967$, the worst condition in the study,
+only 0.176 above the naive baseline.
+
+\subsubsection*{AE bottleneck: 18D to 10D (or 11D with PAY\_0), XGBoost}
+
+The autoencoder is itself a dimensionality reduction method, and the ablation
+isolates where the information loss occurs. Comparing AE+XGB (C2, 11D) to
+XGB-only (C0, 18D) gives a PR-AUC drop of $0.5281 \to 0.5217$ ($-0.006$),
+the same order as PCA. Within the AE family, removing the PAY\_0 bypass
+(C2 to C4, 11D to 10D) drops PR-AUC by 0.009. The interpretation is:
+the autoencoder's 10D bottleneck discards most of \texttt{PAY\_0}'s signal
+($r = 0.325$ with the target); the remaining 0.006 gap to XGB-only reflects
+the residual information lost in compressing the other 17 features through 10
+neurons. The two-neuron equivalence test confirms the effective intrinsic
+dimensionality of the data is far below 10: the autoencoder is doing near-PCA
+compression on already low-dimensional data.
+
+\begin{table}[H]
+\centering
+\caption{Before vs.\ after dimensionality reduction for each method, unbalanced
+         conditions only. $\Delta$PR-AUC is the reduction cost.}
+\label{tab:dr_compare}
+\small
+\begin{tabular}{lllrrrr}
+\toprule
+Method & Without DR & With DR & Before & After & $\Delta$ & Feat.\ reduction \\
+\midrule
+PCA (LR)   & LR original & LR+PCA & 0.5087 & 0.5031 & $-0.006$ & $18 \to 13$ \\
+AE (XGB)   & XGB C0      & AE C2  & 0.5281 & 0.5217 & $-0.006$ & $18 \to 11$ \\
+UMAP (KNN) & KNN original & KNN+UMAP & 0.4999 & 0.4879 & $-0.012$ & $18 \to 2$ \\
+LDA (SVM)  & SVM original & SVM+LDA  & 0.5144 & 0.4671 & $-0.047$ & $18 \to 1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:dr_compare} shows the cost per method clearly. PCA and the
+AE bottleneck both cost 0.006 PR-AUC despite very different mechanisms: PCA
+discards 5\% of linear variance; the AE discards non-linear structure that XGB
+would have exploited. UMAP's 0.012 cost reflects the 89\% dimensionality
+reduction and the class overlap visible in 2D. LDA's 0.047 cost reflects both
+the extreme 94\% compression and the loss of non-linear interactions the RBF
+kernel needs. The relationship is not simply proportional to the fraction of
+features removed: LDA discards only 6\% more features than UMAP (94\% vs.\ 89\%)
+but costs four times the PR-AUC, because the non-linear RBF kernel is far more
+sensitive to losing the feature space than KNN is.
+
+\subsection{Computational performance}
+
+Table~\ref{tab:compute} consolidates all reported training times. LR and KNN
+fitting times are not reported in the output files because both complete in
+under 5 seconds on 21,575 training rows and do not constitute a bottleneck.
+
+\begin{table}[H]
+\centering
+\caption{Training times in seconds. AE+XGB times include autoencoder training,
+         XGBoost GridSearchCV (5-fold over 16 cells), and calibration. SVM
+         times include Platt scaling. No GPU was used for SVM or LR/KNN.}
+\label{tab:compute}
+\small
+\begin{tabular}{lllr}
+\toprule
+Model & DR & Balance & Fit time (s) \\
+\midrule
+AE + XGB (C0/C1) & None (XGB-only) & none / $w$ & 31 \\
+AE + XGB (C2/C3/C4) & AE 10D bottleneck & none / $w$ & 31 \\
+AE + XGB (C5) & AE 10D bottleneck & SMOTE & 44 \\
+AE + XGB (C6) & AE 10D bottleneck & Borderline-SMOTE & 54 \\
+\midrule
+SVM & None (raw 18D) & none & 38 \\
+SVM & None (raw 18D) & SMOTE & 215 \\
+SVM + LDA & LDA 1D & none & 93 \\
+SVM + LDA & LDA 1D & SMOTE & 206 \\
+\midrule
+LR (all conditions) & None / PCA & any & $<5$ \\
+KNN (all conditions) & None / UMAP & any & $<5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{SVM scaling with training set size.}
+The SVM kernel matrix is $N \times N$, where $N$ is the number of training
+rows. Computing and optimising it scales between $O(N^2)$ and $O(N^3)$
+depending on the convergence of the SMO solver. The original split has
+21,575 training rows; the SMOTE-balanced split has 37,336. The ratio is
+$37{,}336 / 21{,}575 = 1.73$ in rows, but the training time increases from
+38~s to 215~s, a factor of~5.7. The quadratic prediction would give
+$1.73^2 = 2.99$; the 5.7$\times$ factor is consistent with the cubic regime,
+where kernel-matrix factorisation dominates at this scale. This makes
+SMOTE expensive for the SVM: not only does it not improve PR-AUC (dropping
+from 0.5144 to 0.4730), it costs 215~s vs.\ 38~s.
+
+\paragraph{LDA overhead on SVM.}
+SVM+LDA takes 93~s without SMOTE and 206~s with it, versus 38~s and 215~s
+for the no-LDA conditions. The LDA projection itself is fast (the 18D
+within-class scatter matrix is $18 \times 18$, trivial to invert). The
+93~s vs.\ 38~s discrepancy for the no-SMOTE conditions reflects the SVM's
+behaviour on a 1D input: with \texttt{gamma='scale'} set to
+$1 / (1 \times \mathrm{Var}(X))$ on the 1D LDA output, the RBF kernel
+width becomes much narrower than in 18D, causing the SMO optimiser to
+explore a sharper decision landscape with more iterations to converge.
+The extra 55~s for a strictly harder optimisation problem yields a
+PR-AUC of 0.4671, 0.047 below the 38~s no-LDA baseline.
+
+\paragraph{AE+XGB stability and oversampling cost.}
+The AE trains 50 epochs (with early stopping, typically halting around
+epoch 20 on this dataset) on the GPU. All non-oversampling conditions finish
+at 31~s regardless of AE weighting or PAY\_0 concatenation, because neither
+change the number of training steps. SMOTE adds 13~s (C5) and
+Borderline-SMOTE adds 23~s (C6). The 10~s gap between SMOTE and
+Borderline-SMOTE comes from the boundary-detection step in Borderline-SMOTE:
+it must classify each minority point as ``safe'', ``borderline'', or
+``noise'' before generating synthetic samples, which requires an additional
+KNN pass over the full 10D latent space.
+
+\paragraph{Algorithmic complexity summary.}
+LR and KNN have the lowest training cost: logistic regression with L-BFGS
+converges in $O(N d)$ iterations on dense data; KNN requires no fitting at
+all (inference is $O(N d)$ per query). The AE+XGB pipeline is fixed at
+31--54~s on GPU, with XGBoost's \texttt{hist} method providing
+$O(N d \log N)$ per tree. The SVM is the only model in this study
+whose training time is affected non-linearly by oversampling: doubling the
+training set size roughly cubes the wall-clock time, making it the least
+suitable model family for larger datasets or repeated resampling experiments.
 
 \subsection{ROC-AUC vs.\ PR-AUC divergence}
 

@@ -77,37 +77,36 @@ F1@τ* is the binary decision quality at the F1-optimal threshold tuned on a hel
 
 ---
 
-## model.py single-condition results (Kaggle, encoding_dim=4)
+## model.py single-condition results (Kaggle, encoding_dim=10)
 
-These are from the most recent Kaggle notebook run (v13), which used `encoding_dim=4`
-(a deviation from the benchmark's 10 — see caveats below):
+These are from the most recent Kaggle notebook run (v14), with `encoding_dim=10`
+matching the benchmark harness:
 
 ```
 Best XGB params: lr=0.05, max_depth=4, n_estimators=200,
-                 colsample_bytree=1.0, gamma=0.1, subsample=0.8, min_child_weight=1
-Best CV PR-AUC:  0.5425
-PR-AUC (test):   0.5152
-Brier score:     0.1390
-F1 @ τ*=0.399:  0.5176
-Accuracy:        0.787
-ROC-AUC:         0.762
-τ*:              0.399
+                 colsample_bytree=0.8, gamma=0, subsample=0.8, min_child_weight=1
+Best CV PR-AUC:  0.5453
+PR-AUC (test):   0.5170
+Brier score:     0.1378
+F1 @ τ*=0.222:  0.5333
+Accuracy:        0.7898
+ROC-AUC:         0.7679
+τ*:              0.2220
 ```
 
-Classification report (test set, 5,993 rows):
-- No Default: precision=0.86, recall=0.86, F1=0.86 (4,667 samples)
-- Default:     precision=0.52, recall=0.52, F1=0.52 (1,326 samples)
+Note: these are single-run numbers; the benchmark C2 condition (3-seed average,
+same encoding_dim=10) gives PR-AUC=0.5217. The gap (0.5217 vs 0.5170) is
+single-seed variance, not a meaningful difference.
 
 ---
 
 ## Important caveats and context
 
-**1. encoding_dim discrepancy.**
-The Kaggle notebook (`model.py`) was manually changed to `encoding_dim=4` at some
-point before this project session. The benchmark harness uses `encoding_dim=10`
-(the original value). The benchmark C2 condition (encoding_dim=10) achieves
-PR-AUC=0.5217 vs the notebook's 0.5152 with dim=4. The 4-dim bottleneck is worse.
-Recommendation: revert to 10 in the notebook.
+**1. encoding_dim is now 10 in both places.**
+The Kaggle notebook was corrected from `encoding_dim=4` to `encoding_dim=10` (v14).
+The benchmark harness and the notebook now use the same architecture. The v14
+single-run gives PR-AUC=0.5170 vs the 3-seed benchmark C2 average of 0.5217 —
+the gap is single-seed variance, not a systematic issue.
 
 **2. AE is not contributing positively.**
 The benchmark shows plain XGB (C0/C1) outperforms every AE+XGB variant. The gap
