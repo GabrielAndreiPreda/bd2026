@@ -1,13 +1,31 @@
-"""A/B benchmark harness for the AE+XGB credit-default pipeline.
+"""4x4 dim-reduction x classifier benchmark for credit-default prediction.
 
-Runs 7 conditions × 3 seeds with a reduced XGBoost grid; produces a markdown
-report and CSV in ./bench_out/. See MEMORY.md for what each condition isolates.
+Runs every pairing of {AE, PCA, UMAP, LDA} x {XGBoost, LogReg, KNN, SVM} on the
+same train/cal/test split with the same evaluation protocol, then writes the
+results as a 4x4 matrix.
 
-Requires: xgboost, imbalanced-learn, tensorflow, scikit-learn, pandas, numpy.
+Configuration (locked by user choices):
+  - 16 cells, no raw-feature baseline
+  - Single seed = 42
+  - Original training variant only (no SMOTE, no class reweighting)
+  - No PAY_0 concat (clean dim-reduction comparison)
+  - Each classifier uses its team's grid (XGB: 16 cells, KNN: 20 cells,
+    LogReg/SVM: fixed hyperparameters)
+
+Requires: xgboost, scikit-learn, tensorflow, umap-learn, pandas, numpy.
+  pip install xgboost umap-learn
 
 Usage:
     python benchmark.py
 """
+
+import subprocess
+import sys
+
+try:
+    from umap import UMAP  # noqa: F401
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "umap-learn"])
 
 import json
 import os
@@ -23,7 +41,9 @@ from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.models import Model
 
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -33,12 +53,12 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
+from umap import UMAP  # noqa: E402
 from xgboost import XGBClassifier
-
-from imblearn.over_sampling import SMOTE, BorderlineSMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
 
 
 # ---------------------------------------------------------------------------
@@ -59,34 +79,36 @@ def _find_csv():
 
 CSV_PATH = _find_csv()
 OUT_DIR = Path("/kaggle/working/bench_out") if Path("/kaggle/working").exists() else Path(__file__).resolve().parent / "bench_out"
-SEEDS = [0, 1, 2]
+SEED = 42
 
-# Reduced grid: 16 cells × 5 folds = 80 fits per condition.
-PARAM_GRID = {
+DIMREDS = ["ae", "pca", "umap", "lda"]
+CLFS = ["xgb", "lr", "knn", "svm"]
+
+XGB_GRID = {
     "n_estimators":     [200, 400],
     "max_depth":        [4, 6],
     "learning_rate":    [0.05, 0.1],
     "min_child_weight": [1, 3],
 }
 
-CONDITIONS = [
-    dict(id="C0", use_ae=False, ae_weighted=None,  use_pay0=False, spw="auto", sampler=None),
-    dict(id="C1", use_ae=False, ae_weighted=None,  use_pay0=False, spw=1.0,    sampler=None),
-    dict(id="C2", use_ae=True,  ae_weighted=True,  use_pay0=True,  spw="auto", sampler=None),
-    dict(id="C3", use_ae=True,  ae_weighted=False, use_pay0=True,  spw="auto", sampler=None),
-    dict(id="C4", use_ae=True,  ae_weighted=True,  use_pay0=False, spw="auto", sampler=None),
-    dict(id="C5", use_ae=True,  ae_weighted=True,  use_pay0=True,  spw=1.0,    sampler="smote"),
-    dict(id="C6", use_ae=True,  ae_weighted=True,  use_pay0=True,  spw=1.0,    sampler="borderline"),
-]
+KNN_GRID = {
+    "n_neighbors": [5, 11, 15, 21, 31],
+    "weights":     ["uniform", "distance"],
+    "metric":      ["euclidean", "manhattan"],
+}
 
-CONDITION_DESCRIPTIONS = {
-    "C0": "XGB-only, scale_pos_weight=auto",
-    "C1": "XGB-only, scale_pos_weight=1",
-    "C2": "AE+XGB current (B.4 weighted AE + C.3 PAY_0 concat)",
-    "C3": "AE+XGB without B.4 (class-blind AE)",
-    "C4": "AE+XGB without C.3 (latents only)",
-    "C5": "AE+XGB + SMOTE on latents (scale_pos_weight=1)",
-    "C6": "AE+XGB + Borderline-SMOTE on latents (scale_pos_weight=1)",
+DIMRED_LABELS = {
+    "ae":   "AE (10 latents)",
+    "pca":  "PCA (95% var)",
+    "umap": "UMAP (2D)",
+    "lda":  "LDA (1D)",
+}
+
+CLF_LABELS = {
+    "xgb": "XGBoost",
+    "lr":  "LogReg",
+    "knn": "KNN",
+    "svm": "SVM (RBF)",
 }
 
 
@@ -102,15 +124,10 @@ def set_global_seed(seed):
 
 
 # ---------------------------------------------------------------------------
-# Data loading — CSV is fully preprocessed by preprocessing.py
+# Data loading
 # ---------------------------------------------------------------------------
 
 def load_data(csv_path):
-    """Load the ML-ready CSV produced by preprocessing.py.
-
-    Drops the three interpretability-only columns that are retained in the
-    CSV but not used for training.
-    """
     df = pd.read_csv(csv_path)
     drop_cols = ["Pays_amts_total", "Utilization_1", "Risk_score"]
     X = df.drop(columns=["default_payment"] + drop_cols)
@@ -131,28 +148,39 @@ def make_splits(X, y, seed):
     X_cal_scaled = scaler.transform(X_cal).astype(np.float32)
     X_test_scaled = scaler.transform(X_test).astype(np.float32)
 
-    pay_0_idx = X_train.columns.get_loc("PAY_0")
-
     return dict(
-        X_train=X_train,
-        X_cal=X_cal,
-        X_test=X_test,
         y_train=y_train.reset_index(drop=True),
         y_cal=y_cal.reset_index(drop=True),
         y_test=y_test.reset_index(drop=True),
         X_train_scaled=X_train_scaled,
         X_cal_scaled=X_cal_scaled,
         X_test_scaled=X_test_scaled,
-        pay_0_idx=pay_0_idx,
         feature_names=list(X_train.columns),
     )
 
 
 # ---------------------------------------------------------------------------
-# Autoencoder
+# Dim-reduction factory
 # ---------------------------------------------------------------------------
 
-def build_ae(input_dim, seed):
+class AEReducer:
+    """Keras encoder adapted to sklearn's .transform interface."""
+
+    def __init__(self, encoder):
+        self.encoder = encoder
+
+    def transform(self, X):
+        return self.encoder.predict(X, verbose=0).astype(np.float32)
+
+
+def transform_all(reducer, splits):
+    return tuple(
+        np.asarray(reducer.transform(splits[k]), dtype=np.float32)
+        for k in ("X_train_scaled", "X_cal_scaled", "X_test_scaled")
+    )
+
+
+def _build_ae(input_dim, seed):
     tf.keras.utils.set_random_seed(seed)
     inputs = Input(shape=(input_dim,))
     x = Dense(24, activation="relu")(inputs)
@@ -169,255 +197,236 @@ def build_ae(input_dim, seed):
     return autoencoder, encoder
 
 
-def train_ae(X_scaled, y_train, *, weighted, seed):
-    autoencoder, encoder = build_ae(X_scaled.shape[1], seed)
+def _train_ae(X_scaled, seed):
+    autoencoder, encoder = _build_ae(X_scaled.shape[1], seed)
     early_stop = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-
-    fit_kwargs = dict(
-        x=X_scaled,
-        y=X_scaled,
+    autoencoder.fit(
+        X_scaled, X_scaled,
         epochs=50,
         batch_size=256,
         validation_split=0.1,
         callbacks=[early_stop],
         verbose=0,
     )
-    if weighted:
-        spw = (y_train == 0).sum() / (y_train == 1).sum()
-        fit_kwargs["sample_weight"] = np.where(y_train.values == 1, spw, 1.0).astype(np.float32)
-
-    autoencoder.fit(**fit_kwargs)
     return encoder
 
 
-def encode(encoder, X_scaled):
-    return encoder.predict(X_scaled, verbose=0).astype(np.float32)
+def fit_reducer(name, X_scaled, y_train, seed):
+    if name == "ae":
+        encoder = _train_ae(X_scaled, seed)
+        return AEReducer(encoder)
+    if name == "pca":
+        return PCA(n_components=0.95, random_state=seed).fit(X_scaled)
+    if name == "umap":
+        return UMAP(
+            n_components=2,
+            n_neighbors=15,
+            min_dist=0.1,
+            metric="euclidean",
+            random_state=seed,
+        ).fit(X_scaled)
+    if name == "lda":
+        return LinearDiscriminantAnalysis(n_components=1).fit(X_scaled, y_train)
+    raise ValueError(f"Unknown dim-reduction: {name!r}")
 
 
 # ---------------------------------------------------------------------------
-# Features
+# Classifier factory
 # ---------------------------------------------------------------------------
 
-def assemble_features(latents, X_scaled, pay_0_idx, *, use_latents, concat_pay0):
-    if use_latents and concat_pay0:
-        return np.concatenate([latents, X_scaled[:, pay_0_idx:pay_0_idx + 1]], axis=1).astype(np.float32)
-    if use_latents:
-        return latents.astype(np.float32)
-    return X_scaled.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Estimator
-# ---------------------------------------------------------------------------
-
-def build_estimator(seed, *, sampler, scale_pos_weight):
-    xgb = XGBClassifier(
-        scale_pos_weight=scale_pos_weight,
-        random_state=seed,
-        eval_metric="logloss",
-        device="cuda",
-        tree_method="hist",
-    )
-    if sampler is None:
-        return xgb
-    if sampler == "smote":
-        return ImbPipeline([("samp", SMOTE(random_state=seed)), ("clf", xgb)])
-    if sampler == "borderline":
-        return ImbPipeline([("samp", BorderlineSMOTE(random_state=seed)), ("clf", xgb)])
-    raise ValueError(f"Unknown sampler: {sampler!r}")
-
-
-def prefix_grid(grid, has_sampler):
-    if not has_sampler:
-        return grid
-    return {f"clf__{k}": v for k, v in grid.items()}
-
-
-# ---------------------------------------------------------------------------
-# Fit / calibrate / threshold
-# ---------------------------------------------------------------------------
-
-def fit_and_calibrate(estimator, X_train_feat, y_train, X_cal_feat, y_cal, grid, seed):
+def fit_classifier(name, Z_train, y_train, seed):
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
-    t0 = time.time()
 
-    grid_search = GridSearchCV(
-        estimator=estimator,
-        param_grid=grid,
-        scoring="average_precision",
-        cv=cv,
-        n_jobs=1,  # XGBoost on GPU does internal parallelism; multiple jobs cause CUDA contention
-        verbose=0,
-    )
-    grid_search.fit(X_train_feat, y_train)
-    best_est = grid_search.best_estimator_
-    best_params = dict(grid_search.best_params_)
+    if name == "xgb":
+        base = XGBClassifier(
+            random_state=seed,
+            eval_metric="logloss",
+            device="cuda",
+            tree_method="hist",
+        )
+        gs = GridSearchCV(base, XGB_GRID, scoring="average_precision", cv=cv, n_jobs=1, verbose=0)
+        gs.fit(Z_train, y_train)
+        return gs.best_estimator_, dict(gs.best_params_)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=FutureWarning)
-        calibrator = CalibratedClassifierCV(best_est, method="isotonic", cv="prefit")
-        calibrator.fit(X_cal_feat, y_cal)
+    if name == "lr":
+        clf = LogisticRegression(max_iter=2000, random_state=seed)
+        clf.fit(Z_train, y_train)
+        return clf, {}
 
-    y_cal_proba = calibrator.predict_proba(X_cal_feat)[:, 1]
-    precisions, recalls, thresholds = precision_recall_curve(y_cal, y_cal_proba)
+    if name == "knn":
+        base = KNeighborsClassifier()
+        gs = GridSearchCV(base, KNN_GRID, scoring="average_precision", cv=cv, n_jobs=-1, verbose=0)
+        gs.fit(Z_train, y_train)
+        return gs.best_estimator_, dict(gs.best_params_)
+
+    if name == "svm":
+        clf = SVC(
+            kernel="rbf",
+            C=1.0,
+            gamma="scale",
+            probability=True,
+            cache_size=2000,
+            random_state=seed,
+        )
+        clf.fit(Z_train, y_train)
+        return clf, {}
+
+    raise ValueError(f"Unknown classifier: {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Threshold tuning and evaluation
+# ---------------------------------------------------------------------------
+
+def f1_optimal_threshold(y_cal, proba_cal):
+    precisions, recalls, thresholds = precision_recall_curve(y_cal, proba_cal)
     f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12)
     best_idx = int(np.argmax(f1s))
-    tau_star = float(thresholds[best_idx])
-
-    train_sec = time.time() - t0
-    return calibrator, best_params, tau_star, train_sec, y_cal_proba
+    return float(thresholds[best_idx])
 
 
-def evaluate(calibrator, X_test_feat, y_test, tau_star):
-    y_test_proba = calibrator.predict_proba(X_test_feat)[:, 1]
-    y_test_pred = (y_test_proba >= tau_star).astype(int)
-    metrics = dict(
-        pr_auc=float(average_precision_score(y_test, y_test_proba)),
-        brier=float(brier_score_loss(y_test, y_test_proba)),
-        f1=float(f1_score(y_test, y_test_pred)),
-        accuracy=float(accuracy_score(y_test, y_test_pred)),
-        roc_auc=float(roc_auc_score(y_test, y_test_proba)),
+def evaluate(y_true, proba, tau):
+    pred = (proba >= tau).astype(int)
+    return dict(
+        pr_auc=float(average_precision_score(y_true, proba)),
+        brier=float(brier_score_loss(y_true, proba)),
+        f1=float(f1_score(y_true, pred)),
+        accuracy=float(accuracy_score(y_true, pred)),
+        roc_auc=float(roc_auc_score(y_true, proba)),
     )
-    return metrics, y_test_proba
 
 
 # ---------------------------------------------------------------------------
-# Per-condition runner
+# Per-cell runner
 # ---------------------------------------------------------------------------
 
-def run_condition(cfg, seed, ae_cache, splits):
-    cond_id = cfg["id"]
-    y_train = splits["y_train"]
+def run_cell(dimred_name, clf_name, features, splits, seed):
+    Z_train, Z_cal, Z_test = features
 
-    if cfg["spw"] == "auto":
-        spw = float((y_train == 0).sum() / (y_train == 1).sum())
-    else:
-        spw = float(cfg["spw"])
+    t0 = time.time()
+    clf, best_params = fit_classifier(clf_name, Z_train, splits["y_train"], seed)
+    fit_sec = time.time() - t0
 
-    if cfg["use_ae"]:
-        encoder = ae_cache[cfg["ae_weighted"]]
-        latents_train = encode(encoder, splits["X_train_scaled"])
-        latents_cal = encode(encoder, splits["X_cal_scaled"])
-        latents_test = encode(encoder, splits["X_test_scaled"])
-    else:
-        latents_train = latents_cal = latents_test = None
+    proba_cal = clf.predict_proba(Z_cal)[:, 1]
+    tau = f1_optimal_threshold(splits["y_cal"], proba_cal)
 
-    X_train_feat = assemble_features(
-        latents_train, splits["X_train_scaled"], splits["pay_0_idx"],
-        use_latents=cfg["use_ae"], concat_pay0=cfg["use_pay0"],
-    )
-    X_cal_feat = assemble_features(
-        latents_cal, splits["X_cal_scaled"], splits["pay_0_idx"],
-        use_latents=cfg["use_ae"], concat_pay0=cfg["use_pay0"],
-    )
-    X_test_feat = assemble_features(
-        latents_test, splits["X_test_scaled"], splits["pay_0_idx"],
-        use_latents=cfg["use_ae"], concat_pay0=cfg["use_pay0"],
-    )
+    proba_test = clf.predict_proba(Z_test)[:, 1]
+    metrics = evaluate(splits["y_test"], proba_test, tau)
 
-    estimator = build_estimator(seed, sampler=cfg["sampler"], scale_pos_weight=spw)
-    grid = prefix_grid(PARAM_GRID, has_sampler=cfg["sampler"] is not None)
-
-    calibrator, best_params, tau_star, train_sec, y_cal_proba = fit_and_calibrate(
-        estimator, X_train_feat, y_train, X_cal_feat, splits["y_cal"], grid, seed,
-    )
-
-    metrics, y_test_proba = evaluate(calibrator, X_test_feat, splits["y_test"], tau_star)
-
-    OUT_DIR.mkdir(exist_ok=True)
-    with open(OUT_DIR / f"best_params_{cond_id}_{seed}.json", "w") as f:
-        json.dump({str(k): v for k, v in best_params.items()}, f, indent=2)
-
+    p_t, r_t, th_t = precision_recall_curve(splits["y_test"], proba_test)
     np.savez(
-        OUT_DIR / f"cal_diag_{cond_id}_{seed}.npz",
-        y_cal_proba=y_cal_proba, y_test_proba=y_test_proba,
-        y_cal=splits["y_cal"].values, y_test=splits["y_test"].values,
+        OUT_DIR / f"pr_curves_{dimred_name}_{clf_name}.npz",
+        precision=p_t, recall=r_t, thresholds=th_t,
+        proba_test=proba_test, y_test=splits["y_test"].values,
     )
-    p_t, r_t, th_t = precision_recall_curve(splits["y_test"], y_test_proba)
-    np.savez(OUT_DIR / f"pr_curves_{cond_id}_{seed}.npz", precision=p_t, recall=r_t, thresholds=th_t)
+    if best_params:
+        with open(OUT_DIR / f"best_params_{dimred_name}_{clf_name}.json", "w") as f:
+            json.dump({str(k): v for k, v in best_params.items()}, f, indent=2)
 
-    record = dict(
-        cond_id=cond_id,
-        seed=seed,
-        tau_star=tau_star,
-        train_sec=train_sec,
-        scale_pos_weight=spw,
-        n_features=X_train_feat.shape[1],
+    return dict(
+        dimred=dimred_name,
+        clf=clf_name,
+        n_features=Z_train.shape[1],
+        tau=tau,
+        fit_sec=fit_sec,
         **metrics,
     )
-    return record
 
 
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
-def write_long_csv(records, path):
-    pd.DataFrame(records).to_csv(path, index=False)
+def _pivot(df, value):
+    return df.pivot(index="dimred", columns="clf", values=value).reindex(index=DIMREDS, columns=CLFS)
+
+
+def write_matrices(records, out_dir):
+    df = pd.DataFrame(records)
+    df.to_csv(out_dir / "results_long.csv", index=False)
+
+    for metric, fname in [
+        ("pr_auc",   "matrix_pr_auc.csv"),
+        ("f1",       "matrix_f1.csv"),
+        ("brier",    "matrix_brier.csv"),
+        ("roc_auc",  "matrix_roc_auc.csv"),
+        ("accuracy", "matrix_accuracy.csv"),
+        ("fit_sec",  "matrix_fit_sec.csv"),
+        ("tau",      "matrix_tau.csv"),
+    ]:
+        _pivot(df, metric).to_csv(out_dir / fname, float_format="%.4f")
+
+
+def _format_matrix(df, fmt):
+    headers = ["dimred \\ clf"] + [CLF_LABELS[c] for c in df.columns]
+    lines = ["| " + " | ".join(headers) + " |"]
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for dimred in df.index:
+        row = [DIMRED_LABELS[dimred]]
+        for clf in df.columns:
+            v = df.loc[dimred, clf]
+            row.append(fmt(v) if pd.notna(v) else "—")
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
 
 
 def write_markdown_report(records, path):
     df = pd.DataFrame(records)
-    metrics = ["pr_auc", "brier", "f1", "accuracy", "roc_auc"]
-
-    summary = df.groupby("cond_id")[metrics + ["tau_star", "train_sec"]].agg(["mean", "std"])
-    n_seeds = df["seed"].nunique()
 
     lines = [
-        "# Benchmark results",
+        "# 4x4 dim-reduction x classifier benchmark",
         "",
-        f"_{n_seeds} seeds × {df['cond_id'].nunique()} conditions × 16-cell grid × 5-fold CV._",
+        f"_Single seed = {SEED}, original training variant, no PAY_0 concat._",
         "",
-        "## Conditions",
+        "## PR-AUC (primary metric)",
+        "",
+        _format_matrix(_pivot(df, "pr_auc"), lambda v: f"{v:.4f}"),
+        "",
+        "## F1 at F1-optimal threshold",
+        "",
+        _format_matrix(_pivot(df, "f1"), lambda v: f"{v:.4f}"),
+        "",
+        "## Brier score (lower is better)",
+        "",
+        _format_matrix(_pivot(df, "brier"), lambda v: f"{v:.4f}"),
+        "",
+        "## ROC-AUC",
+        "",
+        _format_matrix(_pivot(df, "roc_auc"), lambda v: f"{v:.4f}"),
+        "",
+        "## Accuracy at tau*",
+        "",
+        _format_matrix(_pivot(df, "accuracy"), lambda v: f"{v:.4f}"),
+        "",
+        "## F1-optimal threshold tau*",
+        "",
+        _format_matrix(_pivot(df, "tau"), lambda v: f"{v:.3f}"),
+        "",
+        "## Classifier fit time (seconds; includes grid search)",
+        "",
+        _format_matrix(_pivot(df, "fit_sec"), lambda v: f"{v:.0f}"),
+        "",
+        "## Output dimensionality per dim-reduction",
         "",
     ]
-    for cid in sorted(df["cond_id"].unique()):
-        lines.append(f"- **{cid}** — {CONDITION_DESCRIPTIONS.get(cid, '(no description)')}")
+    for dimred in DIMREDS:
+        row = df[df["dimred"] == dimred]
+        if not row.empty:
+            n = int(row.iloc[0]["n_features"])
+            lines.append(f"- **{DIMRED_LABELS[dimred]}**: {n} features")
+    lines.append("")
 
+    best_row = df.loc[df["pr_auc"].idxmax()]
     lines += [
+        "## Top cell by PR-AUC",
         "",
-        f"## Results (mean ± std across {n_seeds} seeds)",
+        f"**{DIMRED_LABELS[best_row['dimred']]} x {CLF_LABELS[best_row['clf']]}** — "
+        f"PR-AUC = {best_row['pr_auc']:.4f}, F1@tau* = {best_row['f1']:.4f}, "
+        f"Brier = {best_row['brier']:.4f}, tau* = {best_row['tau']:.3f}.",
         "",
+        "_Single-seed run; differences below ~0.005 PR-AUC are within noise._",
     ]
 
-    headers = ["Condition", "PR-AUC", "Brier", "F1@τ*", "Accuracy", "ROC-AUC", "τ* (mean)", "Train (s)"]
-    lines.append("| " + " | ".join(headers) + " |")
-    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-
-    for cid in sorted(df["cond_id"].unique()):
-        row = [f"**{cid}**"]
-        for m in metrics:
-            mu = summary.loc[cid, (m, "mean")]
-            sd = summary.loc[cid, (m, "std")]
-            row.append(f"{mu:.4f} ± {sd:.4f}")
-        row.append(f"{summary.loc[cid, ('tau_star', 'mean')]:.3f}")
-        row.append(f"{summary.loc[cid, ('train_sec', 'mean')]:.0f}")
-        lines.append("| " + " | ".join(row) + " |")
-
-    by_pr = summary["pr_auc"].sort_values("mean", ascending=False)
-    best_cid = by_pr.index[0]
-    best_mu = by_pr.iloc[0]["mean"]
-    best_sd = by_pr.iloc[0]["std"]
-
-    lines += [
-        "",
-        "## Conclusion",
-        "",
-        f"Top condition by PR-AUC: **{best_cid}** ({CONDITION_DESCRIPTIONS.get(best_cid)}) "
-        f"at {best_mu:.4f} ± {best_sd:.4f}.",
-        "",
-        f"Conditions within 1 std of the top (statistically tied at n={n_seeds}):",
-    ]
-    for cid, row in by_pr.iterrows():
-        if row["mean"] >= best_mu - best_sd:
-            lines.append(f"- {cid}: {row['mean']:.4f} ± {row['std']:.4f}")
-
-    lines += [
-        "",
-        f"_n={n_seeds} seeds; ΔPR-AUC smaller than ~1 std is noise. With n={n_seeds} "
-        "the std is itself noisy (~50% relative error). Treat narrowly-separated "
-        "conditions as undecided rather than ranked._",
-    ]
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -429,44 +438,46 @@ def main():
     OUT_DIR.mkdir(exist_ok=True)
     print(f"CSV: {CSV_PATH}")
     print(f"Output dir: {OUT_DIR}")
-    print(f"Seeds: {SEEDS}")
-    print(f"Conditions: {[c['id'] for c in CONDITIONS]}")
+    print(f"Seed: {SEED}")
+    print(f"Grid: {len(DIMREDS)} dim-reductions x {len(CLFS)} classifiers = {len(DIMREDS) * len(CLFS)} cells")
+
+    set_global_seed(SEED)
 
     print("\nLoading features...")
     X, y = load_data(CSV_PATH)
     print(f"Shape: {X.shape}, positive rate: {y.mean():.3f}")
 
+    splits = make_splits(X, y, seed=SEED)
+    print(f"Train: {splits['X_train_scaled'].shape}, Cal: {splits['X_cal_scaled'].shape}, Test: {splits['X_test_scaled'].shape}")
+
     records = []
-    for seed in SEEDS:
-        print(f"\n=== Seed {seed} ===")
-        set_global_seed(seed)
-        splits = make_splits(X, y, seed=seed)
+    for dimred_name in DIMREDS:
+        t_red = time.time()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            reducer = fit_reducer(dimred_name, splits["X_train_scaled"], splits["y_train"], seed=SEED)
+            features = transform_all(reducer, splits)
+        print(f"\n=== {DIMRED_LABELS[dimred_name]} fitted in {time.time() - t_red:.0f}s ===")
 
-        ae_cache = {}
-        flavors_needed = {c["ae_weighted"] for c in CONDITIONS if c["use_ae"]}
-        for weighted in flavors_needed:
-            label = "weighted" if weighted else "class-blind"
-            t0 = time.time()
-            ae_cache[weighted] = train_ae(
-                splits["X_train_scaled"], splits["y_train"],
-                weighted=weighted, seed=seed,
-            )
-            print(f"  AE ({label}) trained in {time.time() - t0:.0f}s")
-
-        for cfg in CONDITIONS:
-            print(f"  Running {cfg['id']} ({CONDITION_DESCRIPTIONS[cfg['id']]})...", flush=True)
-            rec = run_condition(cfg, seed, ae_cache, splits)
+        for clf_name in CLFS:
+            print(f"  -> {CLF_LABELS[clf_name]}...", flush=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=UserWarning)
+                warnings.simplefilter("ignore", category=FutureWarning)
+                rec = run_cell(dimred_name, clf_name, features, splits, seed=SEED)
             print(
-                f"    PR-AUC={rec['pr_auc']:.4f}  Brier={rec['brier']:.4f}  "
-                f"F1@τ*={rec['f1']:.4f}  τ*={rec['tau_star']:.3f}  train={rec['train_sec']:.0f}s"
+                f"     PR-AUC={rec['pr_auc']:.4f}  F1@tau*={rec['f1']:.4f}  "
+                f"Brier={rec['brier']:.4f}  tau*={rec['tau']:.3f}  fit={rec['fit_sec']:.0f}s"
             )
             records.append(rec)
 
-    write_long_csv(records, OUT_DIR / "results_long.csv")
+    write_matrices(records, OUT_DIR)
     write_markdown_report(records, OUT_DIR / "report.md")
-    print(f"\nDone. {len(records)} records written.")
-    print(f"  CSV:    {OUT_DIR / 'results_long.csv'}")
-    print(f"  Report: {OUT_DIR / 'report.md'}")
+
+    print(f"\nDone. {len(records)} cells written.")
+    print(f"  Long-format CSV: {OUT_DIR / 'results_long.csv'}")
+    print(f"  Matrices:        {OUT_DIR / 'matrix_*.csv'}")
+    print(f"  Report:          {OUT_DIR / 'report.md'}")
 
 
 if __name__ == "__main__":

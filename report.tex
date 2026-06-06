@@ -1434,4 +1434,171 @@ the autoencoder and running XGBoost directly on the 18 standardised features
 with a 16-cell grid search is the best-supported recommendation from
 this benchmark.
 
+%─────────────────────────────────────────────────────────────────────────────
+\section{Post-submission cross-product benchmark}
+%─────────────────────────────────────────────────────────────────────────────
+
+The submitted work pairs each dimensionality reduction method with one
+classifier: AE with XGBoost, PCA with logistic regression, UMAP with KNN, LDA
+with SVM. None of the four teams tested whether their classifier was the
+right partner for their dim-reduction. After submission, a final experiment
+was run on the same train/cal/test split: every dim-reduction method against
+every classifier, in a 4$\times$4 grid. One seed (42), the original class
+distribution only, no \texttt{PAY\_0} concatenation, no class reweighting
+inside any cell. XGBoost used the 16-cell grid from \texttt{benchmark.py};
+KNN used the 20-cell grid from teammate~2; LR and SVM used default
+hyperparameters. Total wall-clock on a Kaggle GPU instance: 8~minutes.
+
+\subsection{The 4$\times$4 PR-AUC matrix}
+
+Table~\ref{tab:matrix_pr_auc} reports PR-AUC for each cell. The top cell is
+PCA + XGBoost at PR-AUC~$= 0.5407$. The worst cell is UMAP + LR at 0.2685,
+below the random baseline of 0.221 by less than five hundredths of a point.
+
+\begin{table}[H]
+\centering
+\caption{4$\times$4 PR-AUC matrix. Rows are dimensionality reduction methods
+         (output dimensionality in parentheses); columns are classifiers.
+         Single seed = 42. Bold marks the row maximum.}
+\label{tab:matrix_pr_auc}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Dim. reduction & XGBoost & LogReg & KNN & SVM (RBF) \\
+\midrule
+AE (10D)   & \textbf{0.5132} & 0.4812 & 0.4968 & 0.4939 \\
+PCA (13D)  & \textbf{0.5407} & 0.5031 & 0.5148 & 0.5157 \\
+UMAP (2D)  & \textbf{0.5115} & 0.2685 & 0.4978 & 0.3676 \\
+LDA (1D)   & 0.4925 & \textbf{0.5027} & 0.4649 & 0.4669 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{PCA dominates the dim-reduction column.}
+PCA reaches the highest PR-AUC in three classifier columns (XGBoost 0.5407,
+KNN 0.5148, SVM 0.5157) and the lowest Brier score in the same three
+(0.1373, 0.1412, 0.1423). PCA at 95\% variance retains 13 of 18 features,
+which is the gentlest compression of the four methods tested -- AE drops to
+10 dimensions, UMAP to 2, LDA to 1. The preprocessing (signed-log on
+monetary features, one-hot on categoricals) leaves a representation that is
+already close to linearly separable, so the dim-reduction method with the
+least information loss wins.
+
+\paragraph{AE is beaten by PCA in every cell.}
+The four AE rows score below the corresponding PCA rows by 0.0275 (XGB),
+0.0219 (LR), 0.0180 (KNN), and 0.0218 (SVM). The 10-neuron bottleneck
+trained over 50 epochs produces a worse representation than a sub-second
+13-component linear projection. This confirms the limitation noted in
+Section~6 -- a Jacobian analysis of the AE found that two of its ten
+latents carried essentially all the variance.
+
+\paragraph{UMAP + Logistic Regression collapses to PR-AUC~$= 0.2685$.}
+The random baseline for this dataset is 0.221. UMAP projects to 2D in a
+way that preserves local neighbourhood structure but not global linear
+separability: defaulters and non-defaulters are interleaved along curved
+paths through the 2D plane. LR fits a single straight decision boundary,
+which cannot trace those curves. KNN on the same UMAP output reaches
+0.4978 because it votes on local neighbours rather than fitting a global
+boundary. SVM with RBF kernel partially recovers (0.3676) and still places
+last in the UMAP row. UMAP works only with classifiers that do not assume
+linear separability of the projected features.
+
+\paragraph{XGBoost wins three of the four rows.}
+XGBoost is the best classifier for AE (0.5132), PCA (0.5407), and UMAP
+(0.5115). It loses only the LDA row, where LR scores 0.5027 vs XGB at
+0.4925. LDA projects onto a single linear discriminant axis, after which no
+non-linear structure remains for XGBoost to split on. The LDA + LR result
+is what LDA was designed to enable: LDA's projection is itself a linear
+discriminant, and LR is the matching linear classifier. With one feature,
+tree-splitting has nothing to outperform.
+
+\paragraph{SVM wins no cell and is the slowest classifier.}
+Fit times in seconds across the four dim-reduction inputs (10D AE, 13D PCA,
+2D UMAP, 1D LDA):
+
+\begin{table}[H]
+\centering
+\caption{Classifier wall-clock fit time in seconds, by 4$\times$4 cell. Grid
+         search included for XGBoost and KNN; LR and SVM use fixed
+         hyperparameters.}
+\label{tab:matrix_fit_sec}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Dim. reduction & XGBoost & LogReg & KNN & SVM \\
+\midrule
+AE (10D)   &  30 & 0.07 &  9 &  76 \\
+PCA (13D)  &  33 & 0.05 & 28 &  86 \\
+UMAP (2D)  &  26 & 0.02 &  1 &  49 \\
+LDA (1D)   &  24 & 0.03 &  1 & 102 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SVM with RBF kernel and Platt scaling pays roughly quadratic cost in the
+21{,}573 training rows, regardless of feature count -- the 1D LDA input
+still costs 102~seconds. SVM produces no PR-AUC benefit on this dataset to
+justify the runtime.
+
+\paragraph{Logistic regression matches XGBoost in two of four rows at zero compute.}
+LR's four fits all complete in under 0.1~seconds. LR finishes within 0.0102
+PR-AUC of XGBoost on LDA (LR 0.5027, XGB 0.4925) and within 0.0376 on PCA
+(LR 0.5031, XGB 0.5407). The UMAP row is the one cell where LR is not
+competitive (0.2685 vs XGB's 0.5115). On linearly-separable inputs, LR's
+quality cost relative to a tuned XGBoost is small and its compute cost is
+zero.
+
+\subsection{Each team's pairing vs.\ the best pairing for their dim-reduction}
+
+\begin{table}[H]
+\centering
+\caption{Each team's submitted classifier choice compared to the
+         row-maximum classifier for the same dim-reduction. All numbers
+         come from the same 4$\times$4 run (seed 42).}
+\label{tab:team_pairings}
+\small
+\begin{tabular}{llrrr}
+\toprule
+Dim. reduction & Submitted clf & PR-AUC & Best clf & Best PR-AUC \\
+\midrule
+AE   & XGBoost & 0.5132 & XGBoost & 0.5132 \\
+PCA  & LogReg  & 0.5031 & XGBoost & 0.5407 \\
+UMAP & KNN     & 0.4978 & XGBoost & 0.5115 \\
+LDA  & SVM     & 0.4669 & LogReg  & 0.5027 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three of the four teams chose a sub-optimal classifier for their reducer.
+AE + XGBoost was already the row-maximum (the AE team had picked the right
+partner). PCA + LR loses 0.0376 PR-AUC compared to PCA + XGBoost. UMAP +
+KNN loses 0.0137 compared to UMAP + XGBoost. LDA + SVM is the most
+costly mistake: it loses 0.0358 PR-AUC compared to LDA + LR and runs
+roughly 3{,}700~times slower (102~s vs 0.027~s) for a worse result.
+
+\paragraph{XGBoost is the safe default; PCA is the safe dim-reduction.}
+If a future team had to pick a pairing without running this matrix, XGBoost
+wins or ties the row in three of four cases, and PCA is the row-maximum
+dim-reduction for three of four classifiers. The intersection -- PCA +
+XGBoost -- is the top cell of the matrix.
+
+\paragraph{The matrix does not contradict the original benchmark's top condition.}
+Table~\ref{tab:ae_results} reported C1 (raw 18 features + XGBoost, no class
+reweighting) at PR-AUC~$= 0.5280 \pm 0.0107$ across 3 seeds. The 4$\times$4
+matrix does not include a raw-features baseline, so it does not directly
+test C1. PCA + XGBoost at 0.5407 is one seed and a slightly different code
+path (no \texttt{scale\_pos\_weight}, no isotonic calibration step), placing
+it 0.0127 above C1's mean -- roughly 1.2 standard deviations of the C1
+distribution. PCA retaining 95\% variance may deliver a small real
+improvement over raw features by removing the lowest-variance feature
+directions, but one seed cannot confirm it.
+
+\paragraph{Single-seed caveat.}
+The original AE+XGB benchmark used 3 seeds and reported $\pm$std of 0.005
+to 0.011 PR-AUC per condition. The 4$\times$4 grid uses one seed. Cells
+separated by less than 0.01 PR-AUC in this matrix should not be treated
+as ranked. Cells separated by 0.02 or more exceed two standard deviations
+of the per-condition variance seen in the original benchmark and can be
+read as ordered.
+
 \end{document}
