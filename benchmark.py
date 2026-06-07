@@ -64,11 +64,6 @@ from sklearn.svm import SVC
 from umap import UMAP  # noqa: E402
 from xgboost import XGBClassifier
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 def _find_csv():
     candidates = [
         "/kaggle/input/datasets/gabrielpredaz/creditcarddata/credit_card_data.csv",
@@ -79,7 +74,6 @@ def _find_csv():
         if os.path.exists(p):
             return p
     raise FileNotFoundError("credit_card_data.csv not found; edit CSV_PATH at the top of benchmark.py")
-
 
 CSV_PATH = _find_csv()
 OUT_DIR = Path("/kaggle/working/bench_out") if Path("/kaggle/working").exists() else Path(__file__).resolve().parent / "bench_out"
@@ -115,21 +109,11 @@ CLF_LABELS = {
     "svm": "SVM (RBF)",
 }
 
-
-# ---------------------------------------------------------------------------
-# Determinism
-# ---------------------------------------------------------------------------
-
 def set_global_seed(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     tf.keras.utils.set_random_seed(seed)
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
 
 def load_data(csv_path):
     df = pd.read_csv(csv_path)
@@ -137,7 +121,6 @@ def load_data(csv_path):
     X = df.drop(columns=["default_payment"] + drop_cols)
     y = df["default_payment"]
     return X, y
-
 
 def make_splits(X, y, seed):
     X_tr_full, X_test, y_tr_full, y_test = train_test_split(
@@ -162,11 +145,6 @@ def make_splits(X, y, seed):
         feature_names=list(X_train.columns),
     )
 
-
-# ---------------------------------------------------------------------------
-# Dim-reduction factory
-# ---------------------------------------------------------------------------
-
 class AEReducer:
     """Keras encoder adapted to sklearn's .transform interface."""
 
@@ -176,13 +154,11 @@ class AEReducer:
     def transform(self, X):
         return self.encoder.predict(X, verbose=0).astype(np.float32)
 
-
 def transform_all(reducer, splits):
     return tuple(
         np.asarray(reducer.transform(splits[k]), dtype=np.float32)
         for k in ("X_train_scaled", "X_cal_scaled", "X_test_scaled")
     )
-
 
 def _build_ae(input_dim, seed):
     tf.keras.utils.set_random_seed(seed)
@@ -200,7 +176,6 @@ def _build_ae(input_dim, seed):
     autoencoder.compile(optimizer="adam", loss="mse")
     return autoencoder, encoder
 
-
 def _train_ae(X_scaled, seed):
     autoencoder, encoder = _build_ae(X_scaled.shape[1], seed)
     early_stop = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
@@ -213,7 +188,6 @@ def _train_ae(X_scaled, seed):
         verbose=0,
     )
     return encoder
-
 
 def fit_reducer(name, X_scaled, y_train, seed):
     if name == "ae":
@@ -232,11 +206,6 @@ def fit_reducer(name, X_scaled, y_train, seed):
     if name == "lda":
         return LinearDiscriminantAnalysis(n_components=1).fit(X_scaled, y_train)
     raise ValueError(f"Unknown dim-reduction: {name!r}")
-
-
-# ---------------------------------------------------------------------------
-# Classifier factory
-# ---------------------------------------------------------------------------
 
 def fit_classifier(name, Z_train, y_train, seed):
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
@@ -277,17 +246,11 @@ def fit_classifier(name, Z_train, y_train, seed):
 
     raise ValueError(f"Unknown classifier: {name!r}")
 
-
-# ---------------------------------------------------------------------------
-# Threshold tuning and evaluation
-# ---------------------------------------------------------------------------
-
 def f1_optimal_threshold(y_cal, proba_cal):
     precisions, recalls, thresholds = precision_recall_curve(y_cal, proba_cal)
     f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12)
     best_idx = int(np.argmax(f1s))
     return float(thresholds[best_idx])
-
 
 def evaluate(y_true, proba, tau):
     pred = (proba >= tau).astype(int)
@@ -298,11 +261,6 @@ def evaluate(y_true, proba, tau):
         accuracy=float(accuracy_score(y_true, pred)),
         roc_auc=float(roc_auc_score(y_true, proba)),
     )
-
-
-# ---------------------------------------------------------------------------
-# Per-cell runner
-# ---------------------------------------------------------------------------
 
 def run_cell(dimred_name, clf_name, features, splits, seed):
     Z_train, Z_cal, Z_test = features
@@ -336,14 +294,8 @@ def run_cell(dimred_name, clf_name, features, splits, seed):
         **metrics,
     )
 
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
-
 def _pivot(df, value):
     return df.pivot(index="dimred", columns="clf", values=value).reindex(index=DIMREDS, columns=CLFS)
-
 
 def write_matrices(records, out_dir):
     df = pd.DataFrame(records)
@@ -359,7 +311,6 @@ def write_matrices(records, out_dir):
         ("tau",      "matrix_tau.csv"),
     ]:
         _pivot(df, metric).to_csv(out_dir / fname, float_format="%.4f")
-
 
 def plot_heatmap(records, metric, title, path, fmt=".4f", cmap="viridis"):
     df = pd.DataFrame(records)
@@ -384,11 +335,6 @@ def plot_heatmap(records, metric, title, path, fmt=".4f", cmap="viridis"):
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     OUT_DIR.mkdir(exist_ok=True)
@@ -434,7 +380,6 @@ def main():
     plot_heatmap(records, "fit_sec", "Fit time (s)",   OUT_DIR / "heatmap_fit_sec.png", fmt=".0f", cmap="rocket_r")
 
     print(f"\nDone. {len(records)} cells, outputs in {OUT_DIR}")
-
 
 if __name__ == "__main__":
     main()

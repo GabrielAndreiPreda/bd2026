@@ -33,11 +33,6 @@ from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_sp
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 
-
-# ---------------------------------------------------------------------------
-# Paths and config
-# ---------------------------------------------------------------------------
-
 DATA_DIR = Path(__file__).resolve().parent.parent
 OUT_DIR  = Path(__file__).resolve().parent / "results"
 OUT_DIR.mkdir(exist_ok=True)
@@ -50,17 +45,11 @@ KNN_GRID = {
     "metric":      ["euclidean", "manhattan"],
 }
 
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
 def load_xy(path):
     df = pd.read_csv(path)
     X = df.drop(columns=["default_payment"] + DROP_COLS)
     y = df["default_payment"]
     return X, y
-
 
 train_df_full = pd.read_csv(DATA_DIR / "train.csv")
 X_train_raw, y_train_raw = load_xy(DATA_DIR / "train.csv")
@@ -72,16 +61,10 @@ X_tr, X_cal, y_tr, y_cal = train_test_split(
     test_size=0.10, random_state=42, stratify=y_train_raw,
 )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def find_tau(y_true, y_proba):
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
     f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12)
     return float(thresholds[np.argmax(f1s)])
-
 
 def evaluate(y_true, y_proba, tau):
     y_pred = (y_proba >= tau).astype(int)
@@ -94,7 +77,6 @@ def evaluate(y_true, y_proba, tau):
         "tau_star": tau,
     }
 
-
 def tune_knn(X_fit, y_fit):
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
     gs = GridSearchCV(
@@ -104,11 +86,6 @@ def tune_knn(X_fit, y_fit):
     t0 = time.time()
     gs.fit(X_fit, y_fit)
     return gs.best_estimator_, gs.best_params_, time.time() - t0
-
-
-# ---------------------------------------------------------------------------
-# UMAP visualisation (fit on full original training set)
-# ---------------------------------------------------------------------------
 
 scaler_viz = StandardScaler()
 X_train_viz_s = scaler_viz.fit_transform(X_train_raw)
@@ -177,11 +154,6 @@ plt.tight_layout()
 plt.savefig(OUT_DIR / "umap_comparison_original_vs_balanced.png", dpi=150)
 plt.close()
 
-
-# ---------------------------------------------------------------------------
-# Classification experiments
-# ---------------------------------------------------------------------------
-
 scaler = StandardScaler()
 X_tr_s   = scaler.fit_transform(X_tr)
 X_cal_s  = scaler.transform(X_cal)
@@ -240,11 +212,6 @@ for variant, X_fit_s, y_fit in [
         plt.tight_layout()
         plt.savefig(OUT_DIR / f"confusion_matrix_{tag}.png", dpi=150)
         plt.close()
-
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
 
 results_df = pd.DataFrame(records)
 results_df.to_csv(OUT_DIR / "results.csv", index=False)

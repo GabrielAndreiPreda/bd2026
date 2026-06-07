@@ -35,28 +35,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
-
-# ---------------------------------------------------------------------------
-# Paths and config
-# ---------------------------------------------------------------------------
-
 DATA_DIR = Path(__file__).resolve().parent.parent
 OUT_DIR  = Path(__file__).resolve().parent / "results"
 OUT_DIR.mkdir(exist_ok=True)
 
 DROP_COLS = ["Pays_amts_total", "Utilization_1", "Risk_score"]
 
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
 def load_xy(path):
     df = pd.read_csv(path)
     X = df.drop(columns=["default_payment"] + DROP_COLS)
     y = df["default_payment"]
     return X, y
-
 
 X_train_raw, y_train_raw = load_xy(DATA_DIR / "train.csv")
 X_train_bal, y_train_bal = load_xy(DATA_DIR / "train_balanced.csv")
@@ -67,16 +56,10 @@ X_tr, X_cal, y_tr, y_cal = train_test_split(
     test_size=0.10, random_state=42, stratify=y_train_raw,
 )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def find_tau(y_true, y_proba):
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
     f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12)
     return float(thresholds[np.argmax(f1s)])
-
 
 def evaluate(y_true, y_proba, tau):
     y_pred = (y_proba >= tau).astype(int)
@@ -88,11 +71,6 @@ def evaluate(y_true, y_proba, tau):
         "roc_auc":  float(roc_auc_score(y_true, y_proba)),
         "tau_star": tau,
     }
-
-
-# ---------------------------------------------------------------------------
-# Experiments
-# ---------------------------------------------------------------------------
 
 VARIANTS = [
     ("original", X_tr,        y_tr),
@@ -178,11 +156,6 @@ for variant_name, X_fit, y_fit in VARIANTS:
             ax.legend(); plt.tight_layout()
             plt.savefig(OUT_DIR / f"roc_curve_{tag}.png", dpi=150)
             plt.close()
-
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
 
 results_df = pd.DataFrame(records)
 results_df.to_csv(OUT_DIR / "results.csv", index=False)

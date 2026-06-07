@@ -23,11 +23,6 @@ engineered_feats = [
     "Utilization_mean", "Risk_score",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Distributions
-# ---------------------------------------------------------------------------
-
 plt.figure(figsize=(6, 4))
 sns.countplot(x="default_payment", data=df)
 plt.title("Default vs Non-Default Distribution")
@@ -57,11 +52,6 @@ plt.tight_layout()
 plt.savefig(OUT / "pay0_distribution.png", dpi=150)
 plt.close()
 
-
-# ---------------------------------------------------------------------------
-# Correlations
-# ---------------------------------------------------------------------------
-
 plt.figure(figsize=(18, 12))
 sns.heatmap(df.corr(numeric_only=True), cmap="coolwarm", linewidths=0.2)
 plt.title("Feature Correlation Heatmap")
@@ -79,11 +69,6 @@ plt.tight_layout()
 plt.savefig(OUT / "correlation_heatmap_engineered.png", dpi=150)
 plt.close()
 
-
-# ---------------------------------------------------------------------------
-# Outliers and engineered feature distributions
-# ---------------------------------------------------------------------------
-
 for col in ["LIMIT_BAL", "AGE", "Bill_mean", "Pays_amts_mean"]:
     plt.figure(figsize=(6, 4))
     sns.boxplot(x=df[col])
@@ -97,11 +82,6 @@ plt.suptitle("Engineered Feature Distributions")
 plt.tight_layout()
 plt.savefig(OUT / "engineered_features_distributions.png", dpi=150)
 plt.close()
-
-
-# ---------------------------------------------------------------------------
-# Numerical summaries
-# ---------------------------------------------------------------------------
 
 corr_target = (
     df.corr(numeric_only=True)["default_payment"]

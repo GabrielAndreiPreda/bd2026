@@ -16,15 +16,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-
 def _signed_log1p(s):
     """sign-preserving log; handles negative bill values (~2% of rows)."""
     return np.sign(s) * np.log1p(np.abs(s))
-
-
-# ---------------------------------------------------------------------------
-# Load and clean
-# ---------------------------------------------------------------------------
 
 df = pd.read_csv("UCI_Credit_Card.csv")
 df.rename(columns={"default.payment.next.month": "default_payment"}, inplace=True)
@@ -34,11 +28,6 @@ df["MARRIAGE"] = df["MARRIAGE"].replace(0, 3)
 
 df.drop("ID", axis=1, inplace=True)
 df = df.drop_duplicates().reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Feature engineering
-# ---------------------------------------------------------------------------
 
 pays = ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
 bills = ["BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6"]
@@ -68,11 +57,6 @@ df["n_months_over_limit"] = (
     df[bills].gt(df["LIMIT_BAL"], axis=0).sum(axis=1).astype(np.int8)
 )
 
-
-# ---------------------------------------------------------------------------
-# Column selection and transforms
-# ---------------------------------------------------------------------------
-
 df = df.drop(columns=pays[1:] + bills + pays_amts)
 
 log_cols = [
@@ -87,11 +71,6 @@ df = pd.get_dummies(
 
 df.to_csv("credit_card_data.csv", index=False)
 
-
-# ---------------------------------------------------------------------------
-# Train / test split
-# ---------------------------------------------------------------------------
-
 X = df.drop(columns=["default_payment"])
 y = df["default_payment"]
 
@@ -101,11 +80,6 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 X_train.assign(default_payment=y_train.values).to_csv("train.csv", index=False)
 X_test.assign(default_payment=y_test.values).to_csv("test.csv", index=False)
-
-
-# ---------------------------------------------------------------------------
-# SMOTENC balancing (preserves one-hot dummy integers during oversampling)
-# ---------------------------------------------------------------------------
 
 try:
     from imblearn.over_sampling import SMOTENC

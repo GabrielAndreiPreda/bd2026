@@ -38,11 +38,6 @@ from tensorflow.keras.callbacks import EarlyStopping
 
 from xgboost import XGBClassifier
 
-
-# ---------------------------------------------------------------------------
-# Data loading and splits
-# ---------------------------------------------------------------------------
-
 df = pd.read_csv("/kaggle/input/datasets/gabrielpredaz/creditcarddata/credit_card_data.csv")
 
 X = df.drop(columns=["default_payment", "Pays_amts_total", "Utilization_1", "Risk_score"])
@@ -59,11 +54,6 @@ scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_cal_scaled   = scaler.transform(X_cal)
 X_test_scaled  = scaler.transform(X_test)
-
-
-# ---------------------------------------------------------------------------
-# Autoencoder
-# ---------------------------------------------------------------------------
 
 input_dim = X_train_scaled.shape[1]
 encoding_dim = 10
@@ -121,11 +111,6 @@ plt.xlabel("MSE")
 plt.tight_layout()
 plt.show()
 
-
-# ---------------------------------------------------------------------------
-# Feature assembly (latents + raw PAY_0)
-# ---------------------------------------------------------------------------
-
 X_train_encoded = encoder.predict(X_train_scaled)
 X_cal_encoded   = encoder.predict(X_cal_scaled)
 X_test_encoded  = encoder.predict(X_test_scaled)
@@ -134,11 +119,6 @@ pay_0_idx = X_train.columns.get_loc("PAY_0")
 X_train_features = np.concatenate([X_train_encoded, X_train_scaled[:, pay_0_idx:pay_0_idx + 1]], axis=1)
 X_cal_features   = np.concatenate([X_cal_encoded,   X_cal_scaled[:, pay_0_idx:pay_0_idx + 1]],   axis=1)
 X_test_features  = np.concatenate([X_test_encoded,  X_test_scaled[:, pay_0_idx:pay_0_idx + 1]],  axis=1)
-
-
-# ---------------------------------------------------------------------------
-# XGBoost grid search
-# ---------------------------------------------------------------------------
 
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 
@@ -171,11 +151,6 @@ grid_search = GridSearchCV(
 grid_search.fit(X_train_features, y_train)
 xgb_model = grid_search.best_estimator_
 
-
-# ---------------------------------------------------------------------------
-# Calibration and threshold
-# ---------------------------------------------------------------------------
-
 calibrator = CalibratedClassifierCV(xgb_model, method="isotonic", cv="prefit")
 calibrator.fit(X_cal_features, y_cal)
 
@@ -183,11 +158,6 @@ y_cal_proba = calibrator.predict_proba(X_cal_features)[:, 1]
 precisions, recalls, thresholds = precision_recall_curve(y_cal, y_cal_proba)
 f1s = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12)
 tau_star = float(thresholds[int(np.argmax(f1s))])
-
-
-# ---------------------------------------------------------------------------
-# Evaluation and plots
-# ---------------------------------------------------------------------------
 
 y_pred_proba = calibrator.predict_proba(X_test_features)[:, 1]
 y_pred = (y_pred_proba >= tau_star).astype(int)
@@ -225,11 +195,6 @@ plt.title("XGBoost Feature Importance (Latents + PAY_0)")
 plt.xlabel("Importance Score")
 plt.tight_layout()
 plt.show()
-
-
-# ---------------------------------------------------------------------------
-# Jacobian: raw feature -> bottleneck neuron
-# ---------------------------------------------------------------------------
 
 n_samples = min(3000, len(X_train_scaled))
 X_jac = X_train_scaled[:n_samples]
