@@ -34,8 +34,12 @@ import time
 import warnings
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.layers import Dense, Dropout, Input
@@ -357,77 +361,29 @@ def write_matrices(records, out_dir):
         _pivot(df, metric).to_csv(out_dir / fname, float_format="%.4f")
 
 
-def _format_matrix(df, fmt):
-    headers = ["dimred \\ clf"] + [CLF_LABELS[c] for c in df.columns]
-    lines = ["| " + " | ".join(headers) + " |"]
-    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-    for dimred in df.index:
-        row = [DIMRED_LABELS[dimred]]
-        for clf in df.columns:
-            v = df.loc[dimred, clf]
-            row.append(fmt(v) if pd.notna(v) else "—")
-        lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines)
-
-
-def write_markdown_report(records, path):
+def plot_heatmap(records, metric, title, path, fmt=".4f", cmap="viridis"):
     df = pd.DataFrame(records)
+    matrix = _pivot(df, metric)
+    row_labels = [DIMRED_LABELS[d] for d in matrix.index]
+    col_labels = [CLF_LABELS[c] for c in matrix.columns]
 
-    lines = [
-        "# 4x4 dim-reduction x classifier benchmark",
-        "",
-        f"_Single seed = {SEED}, original training variant, no PAY_0 concat._",
-        "",
-        "## PR-AUC (primary metric)",
-        "",
-        _format_matrix(_pivot(df, "pr_auc"), lambda v: f"{v:.4f}"),
-        "",
-        "## F1 at F1-optimal threshold",
-        "",
-        _format_matrix(_pivot(df, "f1"), lambda v: f"{v:.4f}"),
-        "",
-        "## Brier score (lower is better)",
-        "",
-        _format_matrix(_pivot(df, "brier"), lambda v: f"{v:.4f}"),
-        "",
-        "## ROC-AUC",
-        "",
-        _format_matrix(_pivot(df, "roc_auc"), lambda v: f"{v:.4f}"),
-        "",
-        "## Accuracy at tau*",
-        "",
-        _format_matrix(_pivot(df, "accuracy"), lambda v: f"{v:.4f}"),
-        "",
-        "## F1-optimal threshold tau*",
-        "",
-        _format_matrix(_pivot(df, "tau"), lambda v: f"{v:.3f}"),
-        "",
-        "## Classifier fit time (seconds; includes grid search)",
-        "",
-        _format_matrix(_pivot(df, "fit_sec"), lambda v: f"{v:.0f}"),
-        "",
-        "## Output dimensionality per dim-reduction",
-        "",
-    ]
-    for dimred in DIMREDS:
-        row = df[df["dimred"] == dimred]
-        if not row.empty:
-            n = int(row.iloc[0]["n_features"])
-            lines.append(f"- **{DIMRED_LABELS[dimred]}**: {n} features")
-    lines.append("")
-
-    best_row = df.loc[df["pr_auc"].idxmax()]
-    lines += [
-        "## Top cell by PR-AUC",
-        "",
-        f"**{DIMRED_LABELS[best_row['dimred']]} x {CLF_LABELS[best_row['clf']]}** — "
-        f"PR-AUC = {best_row['pr_auc']:.4f}, F1@tau* = {best_row['f1']:.4f}, "
-        f"Brier = {best_row['brier']:.4f}, tau* = {best_row['tau']:.3f}.",
-        "",
-        "_Single-seed run; differences below ~0.005 PR-AUC are within noise._",
-    ]
-
-    Path(path).write_text("\n".join(lines) + "\n")
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.heatmap(
+        matrix.values,
+        annot=True,
+        fmt=fmt,
+        cmap=cmap,
+        xticklabels=col_labels,
+        yticklabels=row_labels,
+        ax=ax,
+        cbar_kws={"label": metric},
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Classifier")
+    ax.set_ylabel("Dim. reduction")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -472,12 +428,12 @@ def main():
             records.append(rec)
 
     write_matrices(records, OUT_DIR)
-    write_markdown_report(records, OUT_DIR / "report.md")
+    plot_heatmap(records, "pr_auc",  "PR-AUC",         OUT_DIR / "heatmap_pr_auc.png")
+    plot_heatmap(records, "f1",      "F1 at tau*",     OUT_DIR / "heatmap_f1.png")
+    plot_heatmap(records, "brier",   "Brier score",    OUT_DIR / "heatmap_brier.png", cmap="viridis_r")
+    plot_heatmap(records, "fit_sec", "Fit time (s)",   OUT_DIR / "heatmap_fit_sec.png", fmt=".0f", cmap="rocket_r")
 
-    print(f"\nDone. {len(records)} cells written.")
-    print(f"  Long-format CSV: {OUT_DIR / 'results_long.csv'}")
-    print(f"  Matrices:        {OUT_DIR / 'matrix_*.csv'}")
-    print(f"  Report:          {OUT_DIR / 'report.md'}")
+    print(f"\nDone. {len(records)} cells, outputs in {OUT_DIR}")
 
 
 if __name__ == "__main__":
